@@ -1,0 +1,1279 @@
+"""
+MODULE — SINGLE TICKER PIPELINE + BATCH PROCESSOR
+
+เปลี่ยนจาก v2.0 (รายละเอียดอยู่ในแต่ละ docstring):
+  1. ดึง fundamentals (.info) แยก cache จากราคา/เทคนิคัล + ดึงรอบเดียว
+     (เดิมยิงทั้ง .fast_info และ .info แยกกัน = 2 network call ต่อ ticker
+     ต่อสแกน ทั้งที่ fundamentals ไม่ได้เปลี่ยนรายวัน)
+  2. dividendYield ใช้ guard ตาม magnitude แทนการ assume format คงที่
+     (Yahoo เคยเปลี่ยน format ของ field นี้มาแล้ว — เห็นได้จาก GitHub issues
+     หลายอันใน ranaroussi/yfinance — โค้ดเดิมคูณ 100 เสมอ ถ้า field เปลี่ยน
+     มาเป็น % อยู่แล้วจะได้ yield ผิดเพี้ยนไปมาก)
+  3. retry + exponential backoff ทุก network call (เดิมไม่มี retry เลย)
+  4. batch_scan ใช้ ThreadPoolExecutor ยิง concurrent (เดิม sequential
+     ทีละตัว + sleep คงที่ — ช้าและไม่จำเป็น เพราะงานนี้เป็น I/O-bound)
+  5. relative_strength เรียกด้วยซีรีส์ที่มี date index จริง (ดู indicators.py)
+     แทนการส่ง tuple ของค่าดิบที่ไม่มีวันที่กำกับ
+"""
+import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+from .utils import log_err, retry
+from .indicators import (
+    wilder_rsi, ema, macd, candle_pattern, ema_pattern, squeeze_direction,
+    signal_age, quiet_accumulation, relative_strength, gem_score,
+    strategy_signal, conservative_stars,
+)
+
+
+@retry(times=3, base_delay=0.6)
+def _download_history(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    return yf.Ticker(ticker).history(period=period, interval=interval, auto_adjust=True)
+
+
+@st.cache_data(ttl=3600)
+def _cached_history(ticker: str, period: str, interval: str) -> Optional[pd.DataFrame]:
+    try:
+        df = _download_history(ticker, period, interval)
+        if df is None or df.empty:
+            return None
+        return df
+    except Exception as e:
+        log_err(f"history({ticker})", e)
+        return None
+
+
+def _normalize_dividend_yield(raw) -> float:
+    """
+    Yahoo เคยเปลี่ยน format ของ dividendYield ไปมา (ทศนิยมเช่น 0.024 บางช่วง
+    เทียบเท่า 2.4% แต่บางเวอร์ชันคืนค่าเป็น % ตรงๆ คือ 2.4 อยู่แล้ว) เดิม
+    v2.0 คูณ 100 เสมอ — ถ้า field เปลี่ยนมาเป็น % แล้วจะได้ yield ผิดเป็น
+    240% ทันทีแบบไม่มี error เตือน
+
+    Guard ตรงนี้ใช้ magnitude เป็นตัวตัดสิน: ถ้าค่าที่ได้น้อยกว่า 1 ถือว่า
+    เป็นทศนิยม (คูณ 100) ถ้ามากกว่า 1 ถือว่าเป็น % อยู่แล้ว — robust กว่า
+    การ assume format คงที่ ไม่ว่า yfinance/Yahoo จะเปลี่ยน field นี้อีกกี่ครั้ง
+    """
+    if raw is None:
+        return np.nan
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return np.nan
+    if v <= 0:
+        return 0.0
+    return round(v * 100, 2) if v < 1 else round(v, 2)
+
+
+@retry(times=3, base_delay=0.6)
+def _download_info(ticker: str) -> dict:
+    return yf.Ticker(ticker).info or {}
+
+
+@st.cache_data(ttl=21600)  # 6 ชม. — fundamentals เปลี่ยนช้ากว่าราคามาก ไม่ต้องดึงซ้ำทุกสแกน
+def _cached_fundamentals(ticker: str) -> dict:
+    try:
+        info = _download_info(ticker)
+        pe = info.get("trailingPE") or info.get("forwardPE")
+        pb = info.get("priceToBook")
+        mktcap = info.get("marketCap")
+        return {
+            "pe": round(pe, 2) if pe else np.nan,
+            "pb": round(pb, 2) if pb else np.nan,
+            "div": _normalize_dividend_yield(info.get("dividendYield")),
+            "mktcap_b": round(mktcap / 1e9, 2) if mktcap else np.nan,
+        }
+    except Exception as e:
+        log_err(f"fundamentals({ticker})", e)
+        return {"pe": np.nan, "pb": np.nan, "div": np.nan, "mktcap_b": np.nan}
+
+
+@st.cache_data(ttl=3600)
+def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=None) -> Optional[dict]:
+    """
+    bench_tuple: tuple ของ (date_iso_string, close) ของ benchmark (เช่น SPY)
+    เปลี่ยนจาก v2.0 ที่ส่งเป็น tuple ค่าดิบไม่มีวันที่กำกับ — จำเป็นสำหรับ
+    relative_strength() เวอร์ชันใหม่ที่ join ด้วยวันที่จริง
+    """
+    try:
+        df = _cached_history(ticker, period, interval)
+        if df is None or len(df) < 30:
+            return None
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+        cl = df["Close"]
+        vl = df["Volume"]
+        px = cl.iloc[-1]
+
+        ep = {n: ema(cl, n).iloc[-1] for n in [5, 10, 20, 50, 100, 200]}
+        ed = {n: round((px - v) / v * 100, 2) if v > 0 else np.nan for n, v in ep.items()}
+
+        rsi_val = wilder_rsi(cl)
+        ml, ms, mh = macd(cl)
+        v20a = vl.iloc[-20:].mean() if len(vl) >= 20 else vl.mean()
+        v3ma = vl.iloc[-63:].mean() if len(vl) >= 63 else vl.mean()
+        v6ma = vl.iloc[-126:].mean() if len(vl) >= 126 else vl.mean()
+        vc = vl.iloc[-1]
+        vm20 = round(vc / v20a, 2) if v20a > 0 else np.nan
+        vm3m = round(vc / v3ma, 2) if v3ma > 0 else np.nan
+        vm6m = round(vc / v6ma, 2) if v6ma > 0 else np.nan
+
+        hi52 = cl.rolling(min(252, len(cl))).max().iloc[-1]
+        draw = round((px - hi52) / hi52 * 100, 2) if hi52 > 0 else np.nan
+        prev_c = round(cl.iloc[-2], 2) if len(cl) >= 2 else px
+
+        ytd_start = cl[cl.index.year == datetime.date.today().year]
+        base0 = ytd_start.iloc[0] if len(ytd_start) > 1 else cl.iloc[0]
+        ytd_ret = round((px - base0) / base0 * 100, 2)
+
+        trend = "🟢 Bull" if px > ep[200] else "🔴 Bear"
+        patt = candle_pattern(df)
+        stars = conservative_stars(px, ep[200], rsi_val, vm20 or 0, draw or 0)
+        sig = strategy_signal(px, ep[200], ep[50], rsi_val, vm20 or 0, mh, stars)
+
+        ep_lbl, ep_sc = ema_pattern(px, ep[5], ep[10], ep[20], ep[50], ep[100], ep[200])
+        acc_sc, acc_lb = quiet_accumulation(vl, cl, rsi_val)
+        sq_lbl, bw_now, bw_delta = squeeze_direction(cl)
+        age = signal_age(cl)
+
+        rs20 = rs50 = np.nan
+        if bench_tuple:
+            dates, vals = zip(*bench_tuple)
+            bench = pd.Series(vals, index=pd.to_datetime(dates))
+            rs20 = relative_strength(cl, bench, 20)
+            rs50 = relative_strength(cl, bench, 50)
+
+        fnd = _cached_fundamentals(ticker)
+        gs, gl = gem_score(ep_sc, acc_sc, vm20 or 0, rsi_val, draw or 0, fnd["mktcap_b"])
+
+        return {
+            "Ticker": ticker, "Price": round(px, 2), "ราคาปิด": prev_c,
+            "Trend": trend, "Signal": sig, "Phase": ep_lbl, "Stars": stars,
+            "EMA5": round(ep[5], 2), "EMA10": round(ep[10], 2), "EMA20": round(ep[20], 2),
+            "EMA50": round(ep[50], 2), "EMA100": round(ep[100], 2), "EMA200": round(ep[200], 2),
+            "vs EMA5%": ed[5], "vs EMA10%": ed[10], "vs EMA20%": ed[20],
+            "vs EMA50%": ed[50], "vs EMA100%": ed[100], "vs EMA200%": ed[200],
+            "RSI": rsi_val, "MACD": ml, "Signal_L": ms, "MACD_H": mh,
+            "Vol×20D": vm20, "Vol×3M": vm3m, "Vol×6M": vm6m,
+            "YTD%": ytd_ret, "Drawdown%": draw, "High52W": round(hi52, 2),
+            "vs52W%": round((px - hi52) / hi52 * 100, 2) if hi52 > 0 else np.nan,
+            "Candle": patt, "EMA Pattern": ep_lbl, "Pat Score": ep_sc,
+            "Accum": acc_lb, "Accum Score": acc_sc, "Gem Score": gs, "💎 Gem": gl,
+            "Squeeze": sq_lbl, "BW%": bw_now, "BW Δ5d": bw_delta, "Signal Age": age,
+            "RS 20D": rs20, "RS 50D": rs50,
+            "P/E": fnd["pe"], "P/BV": fnd["pb"], "Div%": fnd["div"], "MktCap$B": fnd["mktcap_b"],
+        }
+    except Exception as e:
+        log_err(f"analyze({ticker})", e)
+        return None
+
+
+def make_bench_tuple(bench_df: pd.DataFrame) -> tuple:
+    """แปลง DataFrame ราคาของ benchmark (เช่น SPY) เป็น tuple ของ (date_iso, close)
+    เพื่อให้ผ่าน st.cache_data ได้ (ต้อง hashable) พร้อมคงวันที่ไว้สำหรับ
+    relative_strength() เวอร์ชันใหม่ — เดิม v2.0 ส่งแค่ tuple(values) ทำให้
+    วันที่หายไปตั้งแต่จุดนี้"""
+    idx = pd.to_datetime(bench_df.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return tuple(zip(idx.strftime("%Y-%m-%d"), bench_df["Close"].values.tolist()))
+
+
+def batch_scan(
+    tickers: tuple,
+    period: str = "1y",
+    interval: str = "1d",
+    bench_tuple=None,
+    max_workers: int = 6,
+    progress_cb: Optional[Callable[[int, int], None]] = None,
+) -> pd.DataFrame:
+    """
+    เดิม v2.0 สแกนทีละตัว sequential (sleep 0.4 วินาทีทุกๆ 25 ตัว) — สแกน
+    300 ตัวต้องรอ network round-trip ของตัวก่อนหน้าจบก่อนถึงจะเริ่มตัวต่อไป
+    ตอนนี้ใช้ ThreadPoolExecutor ยิง concurrent เพราะงานนี้เป็น I/O-bound
+    (รอ network) ไม่ใช่ CPU-bound — max_workers ถูกจำกัดไว้ไม่สูงเกินไป
+    เพื่อลดความเสี่ยงโดน Yahoo rate-limit จาก request ที่ถี่เกินไป
+    """
+    results = []
+    total = len(tickers)
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(analyze, tk, period, interval, bench_tuple): tk for tk in tickers}
+        for fut in as_completed(futures):
+            done += 1
+            try:
+                d = fut.result()
+                if d:
+                    results.append(d)
+            except Exception as e:
+                log_err(f"batch_scan({futures[fut]})", e)
+            if progress_cb:
+                progress_cb(done, total)
+    return pd.DataFrame(results) if results else pd.DataFrame()
+
+
+def fetch_live(ticker: str) -> dict:
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        px = getattr(fi, "last_price", None)
+        pc = getattr(fi, "previous_close", None)
+        chg = round((px - pc) / pc * 100, 2) if px and pc else None
+        return {
+            "price": round(px, 2) if px else "N/A",
+            "change": chg,
+            "high": round(getattr(fi, "day_high", 0) or 0, 2),
+            "low": round(getattr(fi, "day_low", 0) or 0, 2),
+            "vol": f"{int(getattr(fi, 'last_volume', 0) or 0):,}",
+            "cap": f"${(getattr(fi, 'market_cap', 0) or 0) / 1e9:.1f}B",
+        }
+    except Exception as e:
+        log_err(f"fetch_live({ticker})", e)
+        return {}
+
+"""
+DISK CACHE & PERSISTENCE
+  • Scan-result cache ต่อ universe (เหมือน v2.0 เดิม ย้ายมาไว้ที่นี่)
+  • Watchlist persistence — (ใหม่ใน v3.0)
+    เดิม v2.0 watchlist อยู่ใน st.session_state ล้วนๆ → ปิดเบราว์เซอร์/รีโหลด
+    หน้าเว็บแล้วหายทันที ตอนนี้บันทึกลง disk เหมือน scan cache
+  • Last-signal snapshot — (ใหม่ใน v3.0) ใช้เทียบว่ามีหุ้นไหน "เพิ่งเปลี่ยน
+    เป็น Strong Buy/Breakout ตั้งแต่สแกนล่าสุด" เพื่อทำแถบแจ้งเตือนในแดชบอร์ด
+
+ข้อจำกัดที่ควรรู้ (บอกตรงๆ ไม่ได้โฆษณาเกินจริง):
+Streamlit Community Cloud ใช้ container แบบ ephemeral — ไฟล์พวกนี้จะอยู่
+ข้าม "restart/sleep-wake" ตามปกติ แต่จะถูกล้างถ้า redeploy ใหม่จาก git push
+(filesystem ของ container ถูกสร้างใหม่ทั้งหมด) ถ้าต้องการ persistence แบบ
+ถาวร 100% ข้าม deploy ต้องต่อ external storage (Google Sheets/Supabase/S3)
+ซึ่งเป็นข้อจำกัดของแพลตฟอร์ม ไม่ใช่ของโค้ดส่วนนี้
+"""
+import datetime
+import hashlib
+import json
+import os
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+
+from .utils import log_err
+
+CACHE_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".scan_cache"
+)
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+WATCHLIST_PATH = os.path.join(CACHE_DIR, "watchlist.json")
+SIGNALS_DIR = os.path.join(CACHE_DIR, "last_signals")
+os.makedirs(SIGNALS_DIR, exist_ok=True)
+
+
+# ─────────────────────────────────────────────────────────────
+# SCAN-RESULT CACHE (เหมือน v2.0)
+# ─────────────────────────────────────────────────────────────
+def _next_refresh_time(now: datetime.datetime) -> datetime.datetime:
+    bkk = ZoneInfo("Asia/Bangkok")
+    now_bkk = now.astimezone(bkk)
+    cutoff_today = now_bkk.replace(hour=4, minute=0, second=0, microsecond=0)
+    if now_bkk >= cutoff_today:
+        return cutoff_today
+    return cutoff_today - datetime.timedelta(days=1)
+
+
+def cache_key(universe: str, tickers: tuple, period: str, interval: str) -> str:
+    raw = f"{universe}|{period}|{interval}|{','.join(sorted(tickers))}"
+    h = hashlib.md5(raw.encode()).hexdigest()[:10]
+    safe_name = "".join(c for c in universe if c.isalnum())[:20]
+    return f"{safe_name}_{h}"
+
+
+def load_disk_cache(universe: str, tickers: tuple, period: str, interval: str) -> Optional[pd.DataFrame]:
+    key = cache_key(universe, tickers, period, interval)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        saved_at = datetime.datetime.fromisoformat(payload["saved_at"])
+        cutoff = _next_refresh_time(datetime.datetime.now(ZoneInfo("Asia/Bangkok")))
+        if saved_at < cutoff:
+            return None
+        return pd.DataFrame(payload["data"])
+    except Exception as e:
+        log_err(f"load_disk_cache({universe})", e)
+        return None
+
+
+def save_disk_cache(universe: str, tickers: tuple, period: str, interval: str, df: pd.DataFrame) -> None:
+    key = cache_key(universe, tickers, period, interval)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    try:
+        payload = {
+            "saved_at": datetime.datetime.now(ZoneInfo("Asia/Bangkok")).isoformat(),
+            "universe": universe,
+            "data": df.to_dict(orient="records"),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, default=str, ensure_ascii=False)
+    except Exception as e:
+        log_err(f"save_disk_cache({universe})", e)
+
+
+def cache_age_label(universe: str, tickers: tuple, period: str, interval: str) -> str:
+    key = cache_key(universe, tickers, period, interval)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        saved_at = datetime.datetime.fromisoformat(payload["saved_at"])
+        now = datetime.datetime.now(ZoneInfo("Asia/Bangkok"))
+        delta_min = int((now - saved_at).total_seconds() / 60)
+        if delta_min < 60:
+            return f"สแกนล่าสุด {delta_min} นาทีที่แล้ว"
+        elif delta_min < 1440:
+            return f"สแกนล่าสุด {delta_min // 60} ชม.ที่แล้ว"
+        return f"สแกนล่าสุด {saved_at.strftime('%d/%m %H:%M')}"
+    except Exception as e:
+        log_err(f"cache_age_label({universe})", e)
+        return ""
+
+
+def clear_cache_for(universe: str, tickers: tuple, period: str, interval: str) -> bool:
+    """ลบ cache ของ universe นี้ — คืนค่า True ถ้ามีไฟล์ให้ลบจริง"""
+    key = cache_key(universe, tickers, period, interval)
+    path = os.path.join(CACHE_DIR, f"{key}.json")
+    if os.path.exists(path):
+        os.remove(path)
+        return True
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+# WATCHLIST PERSISTENCE (ใหม่ v3.0)
+# ─────────────────────────────────────────────────────────────
+def load_watchlist() -> list:
+    if not os.path.exists(WATCHLIST_PATH):
+        return []
+    try:
+        with open(WATCHLIST_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_err("load_watchlist", e)
+        return []
+
+
+def save_watchlist(items: list) -> None:
+    try:
+        with open(WATCHLIST_PATH, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+    except Exception as e:
+        log_err("save_watchlist", e)
+
+
+# ─────────────────────────────────────────────────────────────
+# LAST-SIGNAL SNAPSHOT — สำหรับแจ้งเตือน "สัญญาณใหม่ตั้งแต่สแกนล่าสุด" (ใหม่ v3.0)
+# ─────────────────────────────────────────────────────────────
+def _signals_path(universe: str) -> str:
+    safe = "".join(c for c in universe if c.isalnum())[:30] or "default"
+    return os.path.join(SIGNALS_DIR, f"{safe}.json")
+
+
+def load_last_signals(universe: str) -> dict:
+    path = _signals_path(universe)
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        log_err("load_last_signals", e)
+        return {}
+
+
+def save_last_signals(universe: str, mapping: dict) -> None:
+    path = _signals_path(universe)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(mapping, f, ensure_ascii=False)
+    except Exception as e:
+        log_err("save_last_signals", e)
+
+"""
+MODULE — STYLES & UI HELPERS
+ย้ายมาจาก v2.0 ตรงๆ (CSS theme, dataframe style functions, info_card)
+"""
+import streamlit as st
+
+CSS_BLOCK = """
+<style>
+/* ── BASE ── */
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+.stApp { background:#0d1117 !important; }
+.main .block-container { padding: 1.2rem 2rem 2rem 2rem !important; max-width:100% !important; }
+
+/* ── ALL TEXT defaults ── */
+p, span, div, label, li, td, th { color:#e6edf3 !important; }
+h1,h2,h3,h4,h5,h6 { color:#ffffff !important; font-weight:700 !important; line-height:1.3 !important; }
+strong, b { color:#ffffff !important; }
+small, .stCaption p { color:#8b949e !important; font-size:0.78rem !important; }
+code { color:#79c0ff !important; background:#161b22 !important; padding:1px 5px !important; border-radius:4px !important; }
+hr { border-color:#21262d !important; margin:1rem 0 !important; }
+
+/* ── METRIC CARDS — CRITICAL: force bright values ── */
+div[data-testid="metric-container"] {
+    background:#161b22 !important;
+    border:1px solid #30363d !important;
+    border-radius:10px !important;
+    padding:14px 18px !important;
+}
+[data-testid="stMetricLabel"] p,
+[data-testid="stMetricLabel"] span,
+[data-testid="stMetricLabel"] div {
+    color:#8b949e !important;
+    font-size:0.72rem !important;
+    font-weight:600 !important;
+    text-transform:uppercase !important;
+    letter-spacing:0.06em !important;
+}
+[data-testid="stMetricValue"],
+[data-testid="stMetricValue"] > div,
+[data-testid="stMetricValue"] span {
+    color:#ffffff !important;
+    -webkit-text-fill-color:#ffffff !important;
+    font-size:1.6rem !important;
+    font-weight:800 !important;
+    line-height:1.25 !important;
+}
+
+/* ── TABS ── */
+.stTabs [data-baseweb="tab-list"] {
+    background:#161b22 !important;
+    border-radius:8px !important;
+    padding:4px !important;
+    gap:2px !important;
+}
+.stTabs [data-baseweb="tab"] {
+    color:#8b949e !important;
+    font-weight:600 !important;
+    font-size:0.85rem !important;
+    border-radius:6px !important;
+    padding:7px 16px !important;
+    background:transparent !important;
+}
+.stTabs [aria-selected="true"] {
+    background:#238636 !important;
+    color:#ffffff !important;
+}
+.stTabs [data-baseweb="tab"]:hover { color:#e6edf3 !important; }
+
+/* ── SIDEBAR ── */
+section[data-testid="stSidebar"] {
+    background:#161b22 !important;
+    border-right:1px solid #21262d !important;
+}
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] span,
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] div { color:#e6edf3 !important; }
+
+/* ── INPUTS ── */
+.stSelectbox [data-baseweb="select"] > div,
+.stMultiSelect [data-baseweb="select"] > div {
+    background:#21262d !important;
+    border-color:#30363d !important;
+}
+.stSelectbox span, .stMultiSelect span { color:#e6edf3 !important; }
+.stTextArea textarea, .stTextInput input {
+    background:#21262d !important;
+    color:#e6edf3 !important;
+    border-color:#30363d !important;
+}
+.stSlider [data-testid="stThumbValue"] span { color:#ffffff !important; }
+
+/* ── BUTTONS ── */
+.stButton > button {
+    background:linear-gradient(135deg,#238636,#2ea043) !important;
+    color:#ffffff !important;
+    border:none !important;
+    border-radius:8px !important;
+    font-weight:700 !important;
+    font-size:0.88rem !important;
+    padding:9px 18px !important;
+}
+.stButton > button:hover {
+    background:linear-gradient(135deg,#2ea043,#3fb950) !important;
+    box-shadow:0 4px 14px rgba(46,160,67,0.35) !important;
+}
+
+/* ── EXPANDER ── */
+details { background:#161b22 !important; border:1px solid #21262d !important; border-radius:8px !important; }
+details summary { color:#c9d1d9 !important; font-weight:600 !important; padding:10px 14px !important; }
+details summary:hover { color:#ffffff !important; }
+
+/* ── DATAFRAME ── */
+.stDataFrame { border-radius:8px !important; overflow:hidden !important; }
+
+/* ── ALERTS ── */
+.stAlert, [data-testid="stNotification"] {
+    background:#1c2128 !important;
+    border-color:#30363d !important;
+}
+.stAlert p { color:#e6edf3 !important; }
+
+/* ── SPINNER ── */
+.stSpinner > div { border-top-color:#2ea043 !important; }
+
+/* ── PROGRESS BAR ── */
+.stProgress > div > div { background:#238636 !important; }
+
+/* ── HIDE CHROME ── */
+#MainMenu, footer, .stDeployButton { display:none !important; }
+</style>
+"""
+
+
+def inject_css() -> None:
+    st.markdown(CSS_BLOCK, unsafe_allow_html=True)
+
+
+def _sty_signal(v):
+    v = str(v)
+    if "Strong Buy" in v or "Hidden Gem" in v: return "color:#3fb950;font-weight:800;"
+    if "Breakout" in v or "เบรคเอาท์" in v:   return "color:#f7b731;font-weight:700;"
+    if "Uptrend"  in v or "ขาขึ้น" in v:       return "color:#3fb950;font-weight:600;"
+    if "Avoid" in v or "ขาลง" in v:             return "color:#f85149;font-weight:700;"
+    if "Watch" in v or "เฝ้าระวัง" in v:       return "color:#d29922;font-weight:600;"
+    if "Squeeze" in v:                           return "color:#ab7df8;font-weight:700;"
+    if "Accum" in v or "Stealth" in v:           return "color:#26c6da;font-weight:700;"
+    return "color:#e6edf3;"
+
+
+def _sty_rsi(v):
+    try:
+        f = float(v)
+        if f < 35: return "color:#3fb950;font-weight:700;"
+        if f > 70: return "color:#f85149;font-weight:700;"
+        if f < 45: return "color:#79c0ff;"
+    except Exception:
+        pass
+    return "color:#e6edf3;"
+
+
+def _sty_pct(v):
+    try:
+        f = float(str(v).replace("%", "").replace("+", ""))
+        if f > 2: return "color:#3fb950;font-weight:600;"
+        if f < -2: return "color:#f85149;font-weight:600;"
+    except Exception:
+        pass
+    return "color:#8b949e;"
+
+
+def _sty_gem(v):
+    v = str(v)
+    if "Hidden Gem" in v: return "color:#ffd700;font-weight:800;"
+    if "Emerging" in v:   return "color:#3fb950;font-weight:700;"
+    if "Watch" in v:      return "color:#d29922;font-weight:600;"
+    return "color:#8b949e;"
+
+
+def _sty_squeeze(v):
+    v = str(v)
+    if "Squeezing" in v:  return "color:#ab7df8;font-weight:800;"
+    if "Tightening" in v: return "color:#79c0ff;font-weight:700;"
+    if "Just Broke" in v: return "color:#3fb950;font-weight:700;"
+    if "Expanding" in v:  return "color:#f7b731;font-weight:600;"
+    return "color:#8b949e;"
+
+
+def _sty_rs(v):
+    try:
+        f = float(v)
+        if f > 5: return "color:#3fb950;font-weight:700;"
+        if f > 0: return "color:#79c0ff;"
+        if f < -5: return "color:#f85149;font-weight:700;"
+        return "color:#d29922;"
+    except Exception:
+        return "color:#8b949e;"
+
+
+def _sty_gs(v):
+    try:
+        n = int(v)
+        if n >= 8: return "color:#ffd700;font-weight:800;"
+        if n >= 6: return "color:#3fb950;font-weight:700;"
+        if n >= 4: return "color:#26c6da;"
+    except Exception:
+        pass
+    return "color:#8b949e;"
+
+
+def _sty_wr(v):
+    try:
+        f = float(v)
+        if f >= 60: return "color:#3fb950;font-weight:700;"
+        if f >= 50: return "color:#79c0ff;"
+        return "color:#f85149;"
+    except Exception:
+        return ""
+
+
+BASE_TBL = {
+    "background-color": "#161b22",
+    "color": "#e6edf3",
+    "border": "1px solid #21262d",
+    "font-size": "13px",
+    "padding": "5px 10px",
+}
+HDR_TBL = [{"selector": "th", "props": [
+    ("background-color", "#21262d"), ("color", "#ffffff"),
+    ("font-weight", "700"), ("font-size", "11px"),
+    ("padding", "8px 10px"), ("text-transform", "uppercase"),
+    ("letter-spacing", "0.05em"),
+]}]
+
+
+def make_table(df, style_map: dict = None) -> object:
+    """Apply consistent dark styling + optional column-level styling."""
+    s = df.style.set_properties(**BASE_TBL).set_table_styles(HDR_TBL).hide(axis="index")
+    if style_map:
+        for col, fn in style_map.items():
+            if col in df.columns:
+                s = s.map(fn, subset=[col])
+    return s
+
+
+def info_card(label: str, value: str, color="#ffffff", sub="") -> str:
+    """Compact HTML metric card — guaranteed readable."""
+    sub_html = f'<div style="color:#8b949e;font-size:0.75rem;margin-top:3px;">{sub}</div>' if sub else ""
+    return (f'<div style="background:#161b22;border:1px solid #30363d;border-radius:10px;'
+            f'padding:14px 16px;min-width:110px;">'
+            f'<div style="color:#8b949e;font-size:0.7rem;font-weight:600;text-transform:uppercase;'
+            f'letter-spacing:0.06em;margin-bottom:6px;">{label}</div>'
+            f'<div style="color:{color};font-size:1.45rem;font-weight:800;line-height:1.2;">{value}</div>'
+            f'{sub_html}'
+            f'</div>')
+
+"""Stock Screener Pro — internal library package (v3.0)."""
+
+"""
+MODULE — BACKTESTER
+
+เปลี่ยนจาก v2.0:
+  1. เข้าซื้อที่ "ราคาเปิดของแท่งถัดไป" (i+1) ไม่ใช่ "ราคาปิดของแท่งที่เกิด
+     สัญญาณ" (i) — เดิมใช้ close ของแท่งเดียวกับที่คำนวณสัญญาณ ซึ่งในทาง
+     ปฏิบัติเทรดจริงทำไม่ได้ (รู้ว่าสัญญาณเกิดก็ต่อเมื่อแท่งนั้นปิดแล้ว)
+  2. เพิ่ม Buy & Hold ของหุ้นตัวเดียวกัน ช่วงเวลาเดียวกัน เป็น benchmark
+     เทียบ — เดิมดู win rate ลอยๆ ไม่รู้ว่ากลยุทธ์ดีกว่า "ถือเฉยๆ" จริงไหม
+  3. เพิ่ม Max Drawdown (จาก equity curve ของ trade ที่ compound ต่อกัน)
+     และ Sharpe ratio แบบประมาณการจาก distribution ของ trade returns
+  4. ระบุข้อจำกัดของ backtest นี้ตรงๆ ในผลลัพธ์ (ดู key "notes")
+
+ข้อจำกัดที่ยังมีอยู่ (ไม่ได้ทำให้ backtest นี้สมบูรณ์แบบ บอกตรงๆ):
+  • ไม่หักค่าคอมมิชชั่น/สเปรด/สลิปเพจ
+  • ทดสอบบนหุ้นที่ "ยังอยู่ใน index วันนี้" เท่านั้น → survivorship bias
+  • Sharpe คำนวณจาก distribution ของ trade returns ไม่ใช่ daily returns
+    แบบเข้มงวด ถือเป็นค่าประมาณ ไม่ใช่ Sharpe ที่ใช้เทียบกับกองทุนจริงได้
+  • กลยุทธ์เดียว ผลย้อนหลังไม่ใช่การันตีผลในอนาคต ไม่ใช่คำแนะนำการลงทุน
+"""
+import numpy as np
+import pandas as pd
+import streamlit as st
+import yfinance as yf
+
+from .utils import log_err, retry
+from .indicators import ema
+
+BACKTEST_NOTES = (
+    "ไม่หักค่าคอมมิชชั่น/สเปรด · ทดสอบบนหุ้นที่ยังอยู่ใน index วันนี้เท่านั้น "
+    "(survivorship bias) · Sharpe เป็นค่าประมาณจาก trade returns ไม่ใช่ "
+    "daily returns แบบเข้มงวด · ผลย้อนหลังไม่ใช่การันตีอนาคต ไม่ใช่คำแนะนำการลงทุน"
+)
+
+
+@retry(times=3, base_delay=0.6)
+def _download_2y(ticker: str) -> pd.DataFrame:
+    return yf.Ticker(ticker).history(period="2y", interval="1d", auto_adjust=True)
+
+
+@st.cache_data(ttl=86400)
+def backtest(ticker: str, hold_days: int = 20) -> dict:
+    try:
+        df = _download_2y(ticker)
+        if df is None or len(df) < 220:
+            return {"error": "ข้อมูลไม่พอ (ต้องการ 2 ปี)"}
+        cl = df["Close"]
+        op = df["Open"]
+        e20, e50, e200 = ema(cl, 20), ema(cl, 50), ema(cl, 200)
+
+        trades = []
+        in_trade = False
+        entry_price = 0.0
+        entry_i = 0
+        upper = len(cl) - hold_days - 2
+        for i in range(200, max(200, upper)):
+            hi = max(e20.iloc[i], e50.iloc[i], e200.iloc[i])
+            lo = min(e20.iloc[i], e50.iloc[i], e200.iloc[i])
+            bw = (hi - lo) / e200.iloc[i] * 100 if e200.iloc[i] > 0 else np.nan
+            if not in_trade and bw < 3.0 and cl.iloc[i] > e200.iloc[i]:
+                entry_price = op.iloc[i + 1]  # เข้าซื้อที่ open ของแท่งถัดไป ไม่ใช่ close วันนี้
+                entry_i = i + 1
+                in_trade = True
+            elif in_trade and (i - entry_i) >= hold_days:
+                exit_price = cl.iloc[i]
+                trades.append({
+                    "ret": round((exit_price - entry_price) / entry_price * 100, 2),
+                    "entry_date": str(cl.index[entry_i].date()),
+                    "exit_date": str(cl.index[i].date()),
+                })
+                in_trade = False
+
+        bh_start = cl.iloc[200]
+        bh_end = cl.iloc[-1]
+        bh_ret = round((bh_end - bh_start) / bh_start * 100, 2)
+
+        if not trades:
+            return {
+                "n": 0, "win_rate": 0, "avg": 0, "best": 0, "worst": 0, "trades": [],
+                "buy_hold_ret": bh_ret, "max_drawdown": 0, "sharpe": None, "notes": BACKTEST_NOTES,
+            }
+
+        rets = [t["ret"] for t in trades]
+        wins = [r for r in rets if r > 0]
+
+        equity = [1.0]
+        for r in rets:
+            equity.append(equity[-1] * (1 + r / 100))
+        equity = np.array(equity)
+        running_max = np.maximum.accumulate(equity)
+        drawdowns = (equity - running_max) / running_max * 100
+        max_dd = round(float(drawdowns.min()), 2)
+
+        ann_factor = 252 / hold_days if hold_days > 0 else 1
+        mean_r, std_r = float(np.mean(rets)), float(np.std(rets))
+        sharpe = round((mean_r / std_r) * np.sqrt(ann_factor), 2) if std_r > 0 else None
+        total_compound_ret = round((equity[-1] - 1) * 100, 2)
+
+        return {
+            "n": len(trades), "win_rate": round(len(wins) / len(trades) * 100, 1),
+            "avg": round(mean_r, 2), "median": round(float(np.median(rets)), 2),
+            "best": round(max(rets), 2), "worst": round(min(rets), 2),
+            "trades": rets, "trade_details": trades,
+            "buy_hold_ret": bh_ret, "strategy_compound_ret": total_compound_ret,
+            "max_drawdown": max_dd, "sharpe": sharpe, "notes": BACKTEST_NOTES,
+        }
+    except Exception as e:
+        log_err(f"backtest({ticker})", e)
+        return {"error": str(e)}
+
+"""MODULE — SECTOR HEATMAP (เหมือน v2.0 logic เดิม ย้ายมาไว้แยกไฟล์)"""
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from .analyzer import analyze
+from .universes import SECTOR_MAP
+
+
+@st.cache_data(ttl=3600)
+def sector_heatmap_data() -> pd.DataFrame:
+    """Scan 1 representative ticker per sector, return quick summary."""
+    rows = []
+    for sector, tickers in SECTOR_MAP.items():
+        sample = tickers[:5]
+        scores = []
+        for tk in sample:
+            d = analyze(tk)
+            if d:
+                scores.append({
+                    "gem": d.get("Gem Score", 0) or 0,
+                    "accum": d.get("Accum Score", 0) or 0,
+                    "rs20": d.get("RS 20D", 0) or 0,
+                    "bull": 1 if "Bull" in str(d.get("Trend", "")) else 0,
+                })
+        if scores:
+            rows.append({
+                "Sector": sector,
+                "Avg Gem Score": round(np.mean([s["gem"] for s in scores]), 1),
+                "Avg Accum": round(np.mean([s["accum"] for s in scores]), 1),
+                "Avg RS 20D": round(np.mean([s["rs20"] for s in scores]), 1),
+                "Bull %": round(np.mean([s["bull"] for s in scores]) * 100, 0),
+                "Sample": ", ".join(sample),
+            })
+    return pd.DataFrame(rows).sort_values("Avg Gem Score", ascending=False)
+
+"""MODULE — TRADINGVIEW WIDGET (relocated unchanged from v2.0)"""
+
+
+def tv_chart(ticker: str, height: int = 620, interval: str = "D") -> None:
+    import streamlit.components.v1 as components
+
+    nyse = {"JPM", "JNJ", "V", "PG", "UNH", "HD", "MA", "DIS", "BAC", "XOM", "CVX", "WMT",
+            "KO", "PFE", "MRK", "T", "VZ", "IBM", "GE", "GM", "F", "GS", "MS", "C", "WFC"}
+    is_thai = ticker.endswith(".BK")
+    sym = ticker.replace(".BK", "") if is_thai else ticker
+    prefix = "SET" if is_thai else ("NYSE" if ticker in nyse else "NASDAQ")
+    html = f"""
+    <div style="border-radius:10px;overflow:hidden;border:1px solid #21262d;">
+    <div class="tradingview-widget-container" style="height:{height}px;width:100%;">
+    <div class="tradingview-widget-container__widget" style="height:{height}px;width:100%;"></div>
+    <script type="text/javascript"
+        src="https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js" async>
+    {{
+        "autosize":true,"symbol":"{prefix}:{sym}","interval":"{interval}",
+        "timezone":"Asia/Bangkok","theme":"dark","style":"1","locale":"th",
+        "backgroundColor":"#0d1117","gridColor":"rgba(48,54,61,0.3)",
+        "hide_top_toolbar":false,"hide_legend":false,"save_image":false,
+        "studies":[
+            {{"id":"MAExp@tv-basicstudies","inputs":{{"length":20}},"styles":{{"plot_0":{{"color":"#f7b731","linewidth":1}}}}}},
+            {{"id":"MAExp@tv-basicstudies","inputs":{{"length":50}},"styles":{{"plot_0":{{"color":"#26c6da","linewidth":1}}}}}},
+            {{"id":"MAExp@tv-basicstudies","inputs":{{"length":200}},"styles":{{"plot_0":{{"color":"#ef5350","linewidth":2}}}}}},
+            "RSI@tv-basicstudies","MACD@tv-basicstudies"
+        ]
+    }}
+    </script></div></div>"""
+    components.html(html, height=height + 10, scrolling=False)
+
+"""
+MODULE — MATH ENGINE
+ทุกฟังก์ชันเหมือน v2.0 เดิม ยกเว้น relative_strength() ที่แก้บั๊กการเทียบวันที่
+(ดู docstring ของฟังก์ชันนั้นสำหรับรายละเอียด)
+"""
+import numpy as np
+import pandas as pd
+
+from .utils import log_err, to_date_indexed
+
+
+def wilder_rsi(prices: pd.Series, period: int = 14) -> float:
+    if len(prices) < period + 1:
+        return np.nan
+    d = prices.diff().dropna()
+    g = d.clip(lower=0)
+    l = (-d).clip(lower=0)
+    ag = g.iloc[:period].mean()
+    al = l.iloc[:period].mean()
+    a = 1.0 / period
+    for i in range(period, len(g)):
+        ag = a * g.iloc[i] + (1 - a) * ag
+        al = a * l.iloc[i] + (1 - a) * al
+    return round(100 - 100 / (1 + ag / al), 2) if al > 0 else 100.0
+
+
+def ema(s: pd.Series, n: int) -> pd.Series:
+    return s.ewm(span=n, adjust=False).mean()
+
+
+def macd(prices: pd.Series):
+    ml = ema(prices, 12) - ema(prices, 26)
+    sig = ema(ml, 9)
+    return round(ml.iloc[-1], 4), round(sig.iloc[-1], 4), round((ml - sig).iloc[-1], 4)
+
+
+def candle_pattern(df: pd.DataFrame) -> str:
+    if len(df) < 2:
+        return "—"
+    c, p = df.iloc[-1], df.iloc[-2]
+    body = abs(c.Close - c.Open)
+    rng = c.High - c.Low
+    if rng == 0:
+        return "—"
+    lo_sh = min(c.Close, c.Open) - c.Low
+    up_sh = c.High - max(c.Close, c.Open)
+    if body / rng < 0.10:
+        return "🕯 Doji"
+    if lo_sh >= 2 * body and up_sh < body * 0.5:
+        return "🔨 Hammer"
+    if c.Close > c.Open and p.Close < p.Open and c.Open < p.Close and c.Close > p.Open:
+        return "🟢 Engulfing"
+    return "—"
+
+
+def ema_pattern(price, e5, e10, e20, e50, e100, e200) -> tuple:
+    vals = [price, e5, e10, e20, e50, e100, e200]
+    if any(v is None or (isinstance(v, float) and np.isnan(v)) for v in vals):
+        return "—", 0
+    parts = []
+    score = 0
+    if price > e5 > e10 > e20 > e50 > e100 > e200:
+        parts.append("🏆 Perfect Uptrend"); score = 5
+    elif price > e5 > e10 > e20 > e50 > e200:
+        parts.append("📈 Strong Uptrend"); score = 4
+    elif e20 > e50 > e200 and price > e20:
+        parts.append("✨ Golden Align"); score = 3
+    sp = (max(e20, e50, e200) - min(e20, e50, e200)) / e200 * 100
+    if sp < 2.5 and price > e200:
+        parts.append("🔥 Squeeze"); score = max(score, 4)
+    elif sp < 4.0 and price > e200:
+        parts.append("⚡ Pre-Squeeze"); score = max(score, 2)
+    if e200 < price < e50 and price > e20:
+        parts.append("🌱 Early Break"); score = max(score, 3)
+    fan = (e5 - e200) / e200 * 100 if e200 > 0 else 0
+    if fan > 8 and price > e5 and e5 > e50:
+        parts.append("🎯 EMA Fan"); score = max(score, 2)
+    if not parts:
+        return ("❌ Below EMA200", 0) if price < e200 else ("🔄 Mixed", 1)
+    return " · ".join(parts), min(score, 5)
+
+
+def squeeze_direction(closes: pd.Series) -> tuple:
+    if len(closes) < 206:
+        return "—", np.nan, np.nan
+    e20, e50, e200 = ema(closes, 20), ema(closes, 50), ema(closes, 200)
+
+    def bw(i):
+        hi = max(e20.iloc[i], e50.iloc[i], e200.iloc[i])
+        lo = min(e20.iloc[i], e50.iloc[i], e200.iloc[i])
+        return (hi - lo) / e200.iloc[i] * 100 if e200.iloc[i] > 0 else np.nan
+
+    bw0, bw5 = bw(-1), bw(-6)
+    if np.isnan(bw0) or np.isnan(bw5):
+        return "—", np.nan, np.nan
+    delta = round(bw0 - bw5, 3)
+    if delta < -0.4:
+        lbl = "🔥 Squeezing"
+    elif delta < 0:
+        lbl = "⚡ Tightening"
+    elif delta < 0.6:
+        lbl = "🌱 Just Broke"
+    else:
+        lbl = "📈 Expanding"
+    return lbl, round(bw0, 2), delta
+
+
+def signal_age(closes: pd.Series) -> int:
+    if len(closes) < 202:
+        return -1
+    e200 = ema(closes, 200)
+    for i in range(1, min(31, len(closes) - 1)):
+        if closes.iloc[-i - 1] < e200.iloc[-i - 1] and closes.iloc[-i] > e200.iloc[-i]:
+            return i - 1
+    return -1
+
+
+def quiet_accumulation(volumes: pd.Series, closes: pd.Series, rsi: float, n: int = 10) -> tuple:
+    if len(volumes) < n or len(closes) < n:
+        return 0, "—"
+    rv = volumes.iloc[-n:]
+    rc = closes.iloc[-n:]
+    slope = np.polyfit(range(n), rv.values, 1)[0] > 0
+    ranges = [abs(rc.iloc[i] - rc.iloc[i - 1]) / rc.iloc[i - 1] * 100 for i in range(1, n)]
+    low_v = np.mean(ranges) < 2.5
+    rsi_ok = not np.isnan(rsi) and rsi < 62
+    va = volumes.iloc[-30:].mean() if len(volumes) >= 30 else volumes.mean()
+    vr = volumes.iloc[-1] / va if va > 0 else 0
+    sweet = 1.05 < vr < 2.5
+    e20s = np.polyfit(range(5), ema(closes, 20).iloc[-5:].values, 1)[0] > 0 if len(closes) >= 20 else False
+    score = sum([slope, low_v, rsi_ok, sweet, e20s])
+    lbl = {5: "🔬 Stealth Accum", 4: "📦 Quiet Accum", 3: "🔍 Possible Accum", 2: "👀 Watch", 1: "—", 0: "—"}[score]
+    return score, lbl
+
+
+def relative_strength(closes: pd.Series, bench: pd.Series, period: int = 20) -> float:
+    """
+    เทียบ % การเปลี่ยนแปลงของหุ้นกับ benchmark (เช่น SPY) ใน N แท่งล่าสุด
+
+    FIX (v3.0) — เดิม v2.0 เทียบโดยใช้ "ตำแหน่ง" (closes.iloc[-period] vs
+    spy.iloc[-period]) ตรงๆ ระหว่าง 2 ซีรีส์ ซึ่งถูกต้องเฉพาะกรณีทั้งคู่มี
+    ปฏิทินวันเทรดเหมือนกันทุกวันเท่านั้น (เช่น หุ้นสหรัฐฯ เทียบกับ SPY ซึ่งใช้
+    ปฏิทิน NYSE เหมือนกัน) แต่ผิดทันทีถ้าเทียบ "หุ้นไทย .BK" กับ SPY เพราะ
+    วันหยุดตลาดไทยกับสหรัฐฯ ไม่ตรงกัน ทำให้ "20 แท่งที่แล้ว" ของหุ้นไทยกับของ
+    SPY ไม่ใช่วันเดียวกันจริง — ค่า RS ที่ได้คลาดเคลื่อนโดยไม่มี error ใดๆ
+    ขึ้นเตือนเลย (silent bug)
+
+    ตอนนี้ join ทั้งสองซีรีส์ด้วย "วันที่จริง" ก่อนคำนวณ (ผ่าน
+    utils.to_date_indexed) เพื่อให้แน่ใจว่าเทียบช่วงเวลาเดียวกันเสมอ ไม่ว่า
+    หุ้นจะมาจากตลาดไหน
+    """
+    if closes is None or bench is None:
+        return np.nan
+    if len(closes) < 2 or len(bench) < 2:
+        return np.nan
+    try:
+        s = to_date_indexed(closes).rename("s")
+        b = to_date_indexed(bench).rename("b")
+        aligned = pd.concat([s, b], axis=1).dropna()
+        if len(aligned) < period + 1:
+            return np.nan
+        sr = (aligned["s"].iloc[-1] - aligned["s"].iloc[-period]) / aligned["s"].iloc[-period] * 100
+        br = (aligned["b"].iloc[-1] - aligned["b"].iloc[-period]) / aligned["b"].iloc[-period] * 100
+        return round(sr - br, 2)
+    except Exception as e:
+        log_err("relative_strength", e)
+        return np.nan
+
+
+def gem_score(pat_score, acc_score, vol20, rsi, drawdown, mktcap_b) -> tuple:
+    s = min(pat_score, 4)
+    s += min(acc_score, 3)
+    if 1.1 <= vol20 <= 2.0:
+        s += 1
+    if 40 <= rsi <= 62:
+        s += 1
+    if isinstance(mktcap_b, float) and 0 < mktcap_b < 10:
+        s += 1
+    s = min(s, 10)
+    lbl = "💎 Hidden Gem" if s >= 8 else "🔭 Emerging Gem" if s >= 6 else "👀 Watch" if s >= 4 else "—"
+    return s, lbl
+
+
+def strategy_signal(price, e200, e50, rsi, vol20, macd_h, stars) -> str:
+    p200 = (price - e200) / e200 * 100 if e200 > 0 else 999
+    if len(stars) >= 3 and rsi < 40 and vol20 > 1.8 and macd_h > 0 and -5 <= p200 <= 3:
+        return "🔥 Strong Buy"
+    if vol20 > 2.0 and price > e50 > e200 and macd_h > 0 and 50 <= rsi <= 75:
+        return "🚀 Breakout"
+    if price > e50 > e200 and 40 <= rsi <= 70:
+        return "📈 ขาขึ้น"
+    if abs(p200) <= 3 and rsi < 50 and macd_h < 0:
+        return "⚠️ เฝ้าระวัง"
+    if rsi > 75:
+        return "⏳ รอ Pullback"
+    if price < e200:
+        return "⚠️ Oversold Bear" if rsi < 30 else "❌ ขาลง"
+    return "🔄 Neutral"
+
+
+def conservative_stars(price, e200, rsi, vol20, drawdown) -> str:
+    s = 0
+    if e200 > 0 and abs((price - e200) / e200 * 100) <= 2:
+        s += 1
+    if rsi < 35:
+        s += 1
+    if vol20 > 2.0:
+        s += 1
+    if -15 <= drawdown <= -5:
+        s += 1
+    return "⭐" * s if s else "—"
+
+"""
+MODULE — UNIVERSE FETCHERS
+ย้ายมาจาก v2.0 ตรงๆ ไม่มีบั๊กในส่วนนี้ที่ต้องแก้ไข เปลี่ยนแค่ตำแหน่งไฟล์
+เพื่อให้ app.py หลักไม่ต้องยาว 1,500+ บรรทัดในไฟล์เดียว
+"""
+import streamlit as st
+import pandas as pd
+
+from .utils import log_err
+
+
+@st.cache_data(ttl=86400)
+def fetch_sp500():
+    try:
+        t = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
+        return sorted([s.replace(".", "-") for s in t["Symbol"].tolist()])
+    except Exception as e:
+        log_err("fetch_sp500", e)
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "PG"]
+
+
+@st.cache_data(ttl=86400)
+def fetch_nasdaq100():
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        for t in tables:
+            cols = [c.lower() for c in t.columns]
+            if "ticker" in cols or "symbol" in cols:
+                col = "Ticker" if "Ticker" in t.columns else "Symbol"
+                tk = [str(x).replace(".", "-") for x in t[col].dropna() if len(str(x)) <= 6]
+                if len(tk) > 50:
+                    return sorted(tk)
+    except Exception as e:
+        log_err("fetch_nasdaq100", e)
+    return ["AAPL", "MSFT", "AMZN", "NVDA", "META", "GOOGL", "TSLA", "AVGO", "COST", "CSCO"]
+
+
+@st.cache_data(ttl=86400)
+def fetch_russell2000():
+    return sorted(["ACVA","ALKT","ARCB","BJRI","CALX","CATO","CBRL","CLFD","COKE","CPSS",
+        "CRAI","CRGY","CSWI","CVCO","DCOM","DFIN","DKNG","DNOW","DXPE","ECPG",
+        "EFSC","EGHT","EPIX","ESCA","ETON","EVRI","EXPI","FBMS","FBNC","FCPT",
+        "FFBC","FFIN","FISI","FIZZ","FLGT","FLNC","FMAO","FMNB","GDEN","GIII",
+        "GNTY","GPOR","HAFC","HALO","HCAT","HCKT","HCSG","HIFS","HMST","HNVR",
+        "HOPE","HTBK","HTLD","HURN","HWKN","HZO","IART","IBCP","IBP","IBTX",
+        "ICAD","ICFI","JACK","JAMF","KALU","KLIC","KNSL","KTOS","LBRT","LCII",
+        "LDOS","LECO","LEVI","LGND","LMAT","LMND","LNTH","LOCO","LUNA","LYFT",
+        "MATX","MBLY","MEDP","MGNI","MLKN","MMSI","MORN","MRTN","MTSI","NABL",
+        "NARI","NATI","NMIH","NOVT","NSIT","NTNX","NVST","OCGN","OMCL","ONTO",
+        "OPCH","OSIS","PACK","PAHC","PCOR","PCRX","PDCO","PENN","PGNY","PLXS",
+        "PODD","POWL","PRDO","PRGS","PRIM","PRLD","PSMT","PSTG","PTCT","PUMP",
+        "QDEL","QTWO","RAMP","RARE","RCKT","RDNT","RGEN","RIOT","RNST","ROCK",
+        "RPRX","RYTM","SAFE","SAGE","SAIA","SATS","SBCF","SFNC","SHLS","SHOO",
+        "SILK","SITM","SKYW","SMCI","SMPL","SNOW","SNPS","SOUN","SPSC","STAA",
+        "STNE","STRL","SUMO","SUPN","SWAV","SWKS","TASK","TDOC","TMDX","TORC",
+        "TRMK","TRNO","TROW","TRST","TTGT","TTMI","TWST","UBCP","UCTT","UDMY",
+        "ULCC","UNFI","UPST","USNA","USTR","VBTX","VERA","VIAV","VIRT","VLCN",
+        "VNDA","VRNS","VRNT","VSEC","VSTO","WAFD","WERN","WEYS","WINA","WKME",
+        "WOLF","WOOF","WSFS","WTFC","XPEL","XPOF","YELP","ZEUS","ZLAB","ZYXI"])
+
+
+@st.cache_data(ttl=86400)
+def fetch_set():
+    base = ["ADVANC","AOT","AWC","BANPU","BBL","BDMS","BEM","BGRIM","BH","BJC",
+            "BTS","CBG","CENTEL","CK","CPALL","CPF","CPN","CRC","DELTA","EA",
+            "EGCO","GULF","HANA","HMPRO","INTUCH","IVL","JMT","KBANK","KCE",
+            "KKP","KTB","KTC","LH","MAKRO","MBK","MINT","MTC","OR","OSP",
+            "PTT","PTTEP","PTTGC","RATCH","SCB","SCC","SCGP","SIRI","SPALI",
+            "THAI","TISCO","TOP","TRUE","TU","VGI","WHAUP","WORK"]
+    mai = ["2S","ACAP","AMA","BFC","BFIT","CRANE","CSP","DCC","EARTH","EPG",
+           "GENCO","HAPPY","HOME","ITEL","JWD","LEO","MASTER","MFEC","KISS"]
+    return sorted([f"{t}.BK" for t in base + mai])
+
+
+@st.cache_data(ttl=86400)
+def fetch_etfs():
+    return sorted(["XLK","XLV","XLF","XLE","XLI","XLB","XLP","XLU","XLRE","XLC","XLY",
+        "QQQ","QQQM","SOXX","SMH","HACK","IGV","WCLD","IWM","IWO","MDY","IJR",
+        "EEM","EWJ","EWZ","FXI","VEA","VWO","INDA","TUR","EWY","EWT",
+        "ARKK","ARKQ","ARKG","ARKF","ARKW","BOTZ","ROBO","AIQ",
+        "GLD","SLV","GDX","GDXJ","USO","COPX",
+        "TQQQ","SOXL","SPXL","TLT","HYG","LQD","EMB",
+        "VYM","SCHD","VIG","NOBL"])
+
+
+@st.cache_data(ttl=86400)
+def fetch_broad_us():
+    sp = fetch_sp500()
+    nd = fetch_nasdaq100()
+    extra = ["AEHR","ALEC","AMBA","AMKR","APPF","ARWR","ATRC","AZEK","BILL",
+             "BIRK","BLKB","BURL","CACC","CAKE","CALM","CARG","CELH","CENTA",
+             "CHDN","CHEF","CHUY","CIVI","CLFD","COMP","COOP","CRDO","CROX",
+             "CWST","DAKT","DDOG","DFIN","DKNG","DLTH","DOCN","DOCS","DOOR",
+             "DRVN","DXCM","EDIT","EGHT","ENVA","EPAM","ESAB","EVGO","EWBC",
+             "EXAS","EXEL","EXPI","FELE","FIGS","FIZZ","FOUR","FROG","GRND",
+             "HIMS","HLIT","HUBS","HWKN","IART","IIPR","IMVT","INDB","INFA",
+             "INST","IONS","IRTC","ITCI","JACK","JAMF","JOBY","KLIC","KNSL",
+             "KTOS","KVYO","LBRT","LEVI","LGND","LMND","LOCO","LYFT","MATX",
+             "MBLY","MEDP","MGNI","MLAB","MLKN","MMSI","MORN","MPWR","MRTN",
+             "MTSI","NARI","NATI","NKTR","NOVT","NSIT","NTNX","OCGN","OMCL",
+             "ONTO","OPCH","PACK","PCOR","PENN","PGNY","PLXS","PODD","POWL",
+             "PRDO","PRGS","PRIM","PSMT","PSTG","PUMP","QDEL","QTWO","RAMP",
+             "RARE","RCKT","RDNT","RGEN","RIOT","ROCK","RPRX","RYTM","SAGE",
+             "SAIA","SATS","SHLS","SHOO","SILK","SITM","SKYW","SMCI","SMPL",
+             "SOUN","SPSC","STAA","STNE","STRL","SUMO","SWAV","SWKS","TASK",
+             "TDOC","TMDX","TRMK","TROW","TTGT","TTMI","TWST","UCTT","UDMY",
+             "ULCC","UPST","USNA","VERA","VIAV","VIRT","VRNS","VRNT","VSEC",
+             "WAFD","WERN","WEYS","WINA","WOLF","WSFS","WTFC","XPEL","YELP"]
+    return sorted(set(sp + nd + extra))
+
+
+SECTOR_MAP = {
+    "Technology | เทคโนโลยี":     ["AAPL","MSFT","NVDA","GOOGL","META","AVGO","ORCL","AMD","QCOM","TXN","AMAT","MU","LRCX","KLAC","CDNS","SNPS","NXPI","MCHP","ADI","FTNT"],
+    "Healthcare | สุขภาพ":        ["UNH","JNJ","LLY","ABBV","MRK","TMO","ABT","DHR","BMY","AMGN","ISRG","VRTX","REGN","GILD","CVS","CI","ELV","HCA","IDXX","DXCM"],
+    "Financials | การเงิน":       ["JPM","BAC","WFC","GS","MS","BLK","SCHW","AXP","USB","PNC","COF","TFC","MCO","SPGI","ICE","CME","AON","MMC","CB","PGR"],
+    "Consumer | สินค้าอุปโภค":    ["AMZN","TSLA","HD","MCD","NKE","SBUX","TGT","LOW","BKNG","MAR","HLT","YUM","DRI","ROST","TJX","ULTA","LULU","DKNG","WYNN","CZR"],
+    "Industrials | อุตสาหกรรม":   ["GE","HON","RTX","LMT","BA","CAT","DE","UPS","FDX","UNP","CSX","NSC","EMR","ETN","PH","ROK","IR","XYL","CARR","OTIS"],
+    "Energy | พลังงาน":           ["XOM","CVX","COP","EOG","SLB","MPC","PSX","VLO","PXD","FANG","HAL","BKR","DVN","HES","APA","CTRA","MRO","OXY","WMB","KMI"],
+    "Comm Svcs | สื่อสาร":        ["NFLX","DIS","CMCSA","T","VZ","CHTR","TMUS","PARA","FOX","FOXA","WBD","EA","TTWO","RBLX","MTCH","IAC","ZG","ANGI","LYFT","UBER"],
+    "Real Estate | อสังหาริมทรัพย์": ["AMT","PLD","CCI","EQIX","PSA","DLR","O","WELL","AVB","EQR","SPG","VTR","ARE","BXP","KIM","REG","NNN","WPC","COLD","IIPR"],
+    "Utilities | สาธารณูปโภค":    ["NEE","DUK","SO","D","SRE","AEP","XEL","PCG","EIX","WEC","ES","ETR","FE","PPL","CMS","AES","NI","EVRG","CNP","LNT"],
+    "Materials | วัสดุ":          ["LIN","APD","ECL","DD","PPG","NEM","FCX","NUE","VMC","MLM","ALB","BALL","IP","CF","MOS","FMC","CE","RPM","ATI","CMC"],
+    "ETFs | กองทุน ETF":          ["SPY","QQQ","IWM","XLK","XLF","XLE","XLV","XLI","XLP","XLU","GLD","TLT","HYG","EEM","EWJ","ARKK","SOXL","TQQQ","VYM","SCHD"],
+    "🚀 Space | อวกาศ":              ["RKLB","LMT","NOC","BA","RTX","ASTS","SPCE","LUNR","RDW","KTOS","IRDM","VSAT","MAXR","ASTR","PL","TDY"],
+    "🤖 AI | ปัญญาประดิษฐ์":         ["NVDA","MSFT","GOOGL","META","AMD","PLTR","SMCI","AVGO","ARM","AI","SNOW","PATH","BBAI","SOUN","UPST","CRM"],
+    "💊 Biotech/Pharma | ยา/ไบโอเทค": ["LLY","UNH","JNJ","MRK","ABBV","VRTX","REGN","GILD","AMGN","MRNA","BNTX","ISRG","BIIB","ALNY","SRPT","RARE"],
+    "🏦 Banking | ธนาคาร":           ["JPM","BAC","WFC","C","GS","MS","USB","PNC","TFC","COF","SCHW","BK","STT","FITB","RF","KEY"],
+    "⚡ EV/Battery | ไฟฟ้า/แบตเตอรี่": ["TSLA","RIVN","LCID","NIO","LI","XPEV","ALB","LTHM","ENVX","QS","FREY","CHPT","BLNK","PLUG","FCEL","STEM"],
+    "🎮 Gaming/Streaming | เกม/สตรีมมิ่ง": ["NFLX","DIS","RBLX","EA","TTWO","NTDOY","SONY","SPOT","PARA","WBD","ATVI","U","RICK","GME","HUYA","DOYU"],
+    "🔒 Crypto/Cyber | คริปโต/ไซเบอร์": ["COIN","MSTR","MARA","RIOT","HUT","CLSK","BITF","CRWD","PANW","ZS","FTNT","OKTA","S","NET","CYBR","TENB"],
+    "🏠 REIT | กองทุนอสังหา":         ["O","PLD","AMT","EQIX","PSA","DLR","SPG","AVB","EQR","WELL","VTR","ARE","BXP","KIM","REG","IIPR"],
+}
+
+UNIVERSE_OPTIONS = {
+    "S&P 500 (503)": fetch_sp500,
+    "Nasdaq 100 (101)": fetch_nasdaq100,
+    "Russell 2000 Small Cap": fetch_russell2000,
+    "US Broad Market (~700)": fetch_broad_us,
+    "หุ้นไทย SET/mai": fetch_set,
+    "ETF Screener (70)": fetch_etfs,
+    "Sector Focus | เลือกตามหมวด": None,
+    "Custom Tickers": None,
+}
+
+
+def resolve_tickers(universe: str, sector_choice: list, custom_input: str) -> list:
+    """single source of truth สำหรับ resolve รายชื่อ ticker (เหมือน v2.0)"""
+    if universe == "Custom Tickers":
+        return [t.strip().upper() for t in custom_input.split(",") if t.strip()]
+    elif universe == "Sector Focus | เลือกตามหมวด":
+        tickers_all = []
+        for s in sector_choice:
+            tickers_all += SECTOR_MAP.get(s, [])
+        return sorted(set(tickers_all))
+    else:
+        fn = UNIVERSE_OPTIONS.get(universe)
+        return fn() if fn else []
+
+"""
+UTILITIES — ใช้ร่วมกันทุกโมดูล
+  • logging (เหมือน v2.0 เดิม)
+  • retry decorator พร้อม exponential backoff — (ใหม่ใน v3.0)
+    เดิม v2.0 ไม่มี retry เลย ถ้า Yahoo ตอบ rate-limit/timeout ครั้งเดียว
+    หุ้นตัวนั้นจะหายไปจากผลสแกนทันทีโดยไม่มีการลองใหม่
+  • to_date_indexed() — (ใหม่ใน v3.0) ใช้ normalize index ของราคาให้เป็น
+    "วันที่" ล้วน (ไม่มี time/timezone) สำหรับเทียบ 2 ซีรีส์ที่มาจาก
+    ตลาดคนละ timezone/ปฏิทินวันเทรด (เช่นหุ้นไทย .BK เทียบกับ SPY สหรัฐฯ)
+"""
+import logging
+import random
+import time
+from functools import wraps
+
+import pandas as pd
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("screener")
+
+
+def log_err(context: str, e: Exception) -> None:
+    """Log error แบบสั้น ไม่ทำให้ UI พัง แค่ไม่ให้ error หายไปเงียบๆ"""
+    logger.warning("%s -> %s: %s", context, type(e).__name__, e)
+
+
+def retry(times: int = 3, base_delay: float = 0.6, exceptions=(Exception,)):
+    """
+    Decorator: ลองใหม่แบบ exponential backoff + jitter เมื่อ network call ล่ม
+    ชั่วคราว (เช่น Yahoo ตอบ 429 / timeout ที่เกิดขึ้นบ่อยบน Streamlit Cloud
+    เพราะ IP เป็น shared IP กับแอปอื่น) ไม่ได้การันตีว่าจะไม่โดนบล็อกอีก
+    แต่ลดอัตราที่ "1 ครั้งพัง = หุ้นหายจากผลสแกนทันที" ลงไปมาก
+    """
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            last_exc = None
+            for attempt in range(times):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    last_exc = e
+                    if attempt < times - 1:
+                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3)
+                        time.sleep(delay)
+            raise last_exc
+        return wrapper
+    return deco
+
+
+def to_date_indexed(s: pd.Series) -> pd.Series:
+    """
+    Normalize index ของ Series ราคาให้เป็นวันที่ล้วน ตัด time + timezone ออก
+    จำเป็นก่อนเทียบ 2 ซีรีส์ที่มี trading calendar ต่างกัน (เช่น SET ไทย vs
+    NYSE สหรัฐฯ มีวันหยุดไม่ตรงกัน) ด้วย "วันที่จริง" แทนตำแหน่ง index
+    """
+    idx = pd.to_datetime(s.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    out = s.copy()
+    out.index = idx.normalize()
+    return out
