@@ -1,0 +1,40 @@
+name: ดึงข้อมูลหุ้นล่วงหน้า (ทุก 4 ชม.)
+
+on:
+  # ตั้งเวลาเป็น UTC — แปลงมาให้ตรงกับเวลาไทยที่มีประโยชน์ที่สุด:
+  # UTC 01:00,05:00,09:00,13:00,17:00,21:00 = ไทย 08:00,12:00,16:00,20:00,00:00,04:00
+  # (04:00 ไทย = หลังตลาดสหรัฐฯปิด, 16:00 ไทย = ใกล้เวลาตลาดไทยปิด)
+  schedule:
+    - cron: "0 1,5,9,13,17,21 * * *"
+  # กดรันมือได้จากแท็บ Actions บน GitHub เวลาอยากดึงสดนอกรอบ
+  workflow_dispatch: {}
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: รัน fetch_data.py
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python fetch_data.py
+
+      - name: Commit และ push ข้อมูลใหม่
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/latest_scan.json data/alerts.json
+          git diff --quiet --cached || git commit -m "Auto-update prefetched stock data [skip ci]"
+          git push
