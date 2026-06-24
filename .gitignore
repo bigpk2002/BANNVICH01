@@ -1,0 +1,5 @@
+.scan_cache/
+__pycache__/
+*.pyc
+.DS_Store
+.streamlit/secrets.toml
