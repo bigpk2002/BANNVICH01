@@ -1,21 +1,19 @@
-"""
-╔══════════════════════════════════════════════════════════════╗
-║   INSTITUTIONAL STOCK SCREENER  —  v3.1 (single-file)        ║
-║   เหมือน v3.0 ทุกจุด (แก้ความแม่นยำ/ความเร็ว/backtest/         ║
-║   alert+watchlist persist) แต่รวมกลับมาเป็นไฟล์เดียว           ║
-║   เพื่อให้ deploy ง่ายแบบเดิม — แทนที่ app.py ไฟล์เดียว จบ       ║
-╚══════════════════════════════════════════════════════════════╝
-สรุปการเปลี่ยนแปลงจาก v2.0 เดิม (รายละเอียดเต็มอยู่ใน docstring/comment
-ของแต่ละฟังก์ชันด้านล่าง):
-  1. ความแม่นยำ: แก้บั๊ก relative_strength เทียบ "ตำแหน่ง" ข้ามตลาดที่ปฏิทิน
-     วันเทรดต่างกัน (หุ้นไทย .BK vs SPY) + guard format ของ dividendYield
-  2. ความเร็ว/เสถียร: ลด network call ต่อ ticker, แยก cache fundamentals
-     ออกจาก cache ราคา, เพิ่ม retry+backoff, สแกนแบบ concurrent
-  3. Backtest: เข้าซื้อที่ open แท่งถัดไป (ไม่ lookahead), เทียบ Buy&Hold,
-     เพิ่ม Max Drawdown และ Sharpe โดยประมาณ
-  4. ฟีเจอร์ใหม่: watchlist persist ข้าม session จริง (เซฟลง disk) +
-     แจ้งเตือนสัญญาณใหม่ (in-app + Telegram แบบออปชัน)
-"""
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   INSTITUTIONAL STOCK SCREENER  —  v3.1 (single-file)        ║
+# ║   เหมือน v3.0 ทุกจุด (แก้ความแม่นยำ/ความเร็ว/backtest/         ║
+# ║   alert+watchlist persist) แต่รวมกลับมาเป็นไฟล์เดียว           ║
+# ║   เพื่อให้ deploy ง่ายแบบเดิม — แทนที่ app.py ไฟล์เดียว จบ       ║
+# ╚══════════════════════════════════════════════════════════════╝
+# สรุปการเปลี่ยนแปลงจาก v2.0 เดิม (รายละเอียดเต็มอยู่ใน docstring/comment
+# ของแต่ละฟังก์ชันด้านล่าง):
+#   1. ความแม่นยำ: แก้บั๊ก relative_strength เทียบ "ตำแหน่ง" ข้ามตลาดที่ปฏิทิน
+#      วันเทรดต่างกัน (หุ้นไทย .BK vs SPY) + guard format ของ dividendYield
+#   2. ความเร็ว/เสถียร: ลด network call ต่อ ticker, แยก cache fundamentals
+#      ออกจาก cache ราคา, เพิ่ม retry+backoff, สแกนแบบ concurrent
+#   3. Backtest: เข้าซื้อที่ open แท่งถัดไป (ไม่ lookahead), เทียบ Buy&Hold,
+#      เพิ่ม Max Drawdown และ Sharpe โดยประมาณ
+#   4. ฟีเจอร์ใหม่: watchlist persist ข้าม session จริง (เซฟลง disk) +
+#      แจ้งเตือนสัญญาณใหม่ (in-app + Telegram แบบออปชัน)
 import datetime
 import hashlib
 import json
@@ -40,16 +38,14 @@ logger = logging.getLogger("screener")
 # ════════════════════════════════════════════════════════
 # [merged from lib/utils.py]
 # ════════════════════════════════════════════════════════
-"""
-UTILITIES — ใช้ร่วมกันทุกโมดูล
-  • logging (เหมือน v2.0 เดิม)
-  • retry decorator พร้อม exponential backoff — (ใหม่ใน v3.0)
-    เดิม v2.0 ไม่มี retry เลย ถ้า Yahoo ตอบ rate-limit/timeout ครั้งเดียว
-    หุ้นตัวนั้นจะหายไปจากผลสแกนทันทีโดยไม่มีการลองใหม่
-  • to_date_indexed() — (ใหม่ใน v3.0) ใช้ normalize index ของราคาให้เป็น
-    "วันที่" ล้วน (ไม่มี time/timezone) สำหรับเทียบ 2 ซีรีส์ที่มาจาก
-    ตลาดคนละ timezone/ปฏิทินวันเทรด (เช่นหุ้นไทย .BK เทียบกับ SPY สหรัฐฯ)
-"""
+# UTILITIES — ใช้ร่วมกันทุกโมดูล
+#   • logging (เหมือน v2.0 เดิม)
+#   • retry decorator พร้อม exponential backoff — (ใหม่ใน v3.0)
+#     เดิม v2.0 ไม่มี retry เลย ถ้า Yahoo ตอบ rate-limit/timeout ครั้งเดียว
+#     หุ้นตัวนั้นจะหายไปจากผลสแกนทันทีโดยไม่มีการลองใหม่
+#   • to_date_indexed() — (ใหม่ใน v3.0) ใช้ normalize index ของราคาให้เป็น
+#     "วันที่" ล้วน (ไม่มี time/timezone) สำหรับเทียบ 2 ซีรีส์ที่มาจาก
+#     ตลาดคนละ timezone/ปฏิทินวันเทรด (เช่นหุ้นไทย .BK เทียบกับ SPY สหรัฐฯ)
 import logging
 import random
 import time
@@ -110,22 +106,20 @@ def to_date_indexed(s: pd.Series) -> pd.Series:
 # ════════════════════════════════════════════════════════
 # [merged from lib/cache_store.py]
 # ════════════════════════════════════════════════════════
-"""
-DISK CACHE & PERSISTENCE
-  • Scan-result cache ต่อ universe (เหมือน v2.0 เดิม ย้ายมาไว้ที่นี่)
-  • Watchlist persistence — (ใหม่ใน v3.0)
-    เดิม v2.0 watchlist อยู่ใน st.session_state ล้วนๆ → ปิดเบราว์เซอร์/รีโหลด
-    หน้าเว็บแล้วหายทันที ตอนนี้บันทึกลง disk เหมือน scan cache
-  • Last-signal snapshot — (ใหม่ใน v3.0) ใช้เทียบว่ามีหุ้นไหน "เพิ่งเปลี่ยน
-    เป็น Strong Buy/Breakout ตั้งแต่สแกนล่าสุด" เพื่อทำแถบแจ้งเตือนในแดชบอร์ด
-
-ข้อจำกัดที่ควรรู้ (บอกตรงๆ ไม่ได้โฆษณาเกินจริง):
-Streamlit Community Cloud ใช้ container แบบ ephemeral — ไฟล์พวกนี้จะอยู่
-ข้าม "restart/sleep-wake" ตามปกติ แต่จะถูกล้างถ้า redeploy ใหม่จาก git push
-(filesystem ของ container ถูกสร้างใหม่ทั้งหมด) ถ้าต้องการ persistence แบบ
-ถาวร 100% ข้าม deploy ต้องต่อ external storage (Google Sheets/Supabase/S3)
-ซึ่งเป็นข้อจำกัดของแพลตฟอร์ม ไม่ใช่ของโค้ดส่วนนี้
-"""
+# DISK CACHE & PERSISTENCE
+#   • Scan-result cache ต่อ universe (เหมือน v2.0 เดิม ย้ายมาไว้ที่นี่)
+#   • Watchlist persistence — (ใหม่ใน v3.0)
+#     เดิม v2.0 watchlist อยู่ใน st.session_state ล้วนๆ → ปิดเบราว์เซอร์/รีโหลด
+#     หน้าเว็บแล้วหายทันที ตอนนี้บันทึกลง disk เหมือน scan cache
+#   • Last-signal snapshot — (ใหม่ใน v3.0) ใช้เทียบว่ามีหุ้นไหน "เพิ่งเปลี่ยน
+#     เป็น Strong Buy/Breakout ตั้งแต่สแกนล่าสุด" เพื่อทำแถบแจ้งเตือนในแดชบอร์ด
+# 
+# ข้อจำกัดที่ควรรู้ (บอกตรงๆ ไม่ได้โฆษณาเกินจริง):
+# Streamlit Community Cloud ใช้ container แบบ ephemeral — ไฟล์พวกนี้จะอยู่
+# ข้าม "restart/sleep-wake" ตามปกติ แต่จะถูกล้างถ้า redeploy ใหม่จาก git push
+# (filesystem ของ container ถูกสร้างใหม่ทั้งหมด) ถ้าต้องการ persistence แบบ
+# ถาวร 100% ข้าม deploy ต้องต่อ external storage (Google Sheets/Supabase/S3)
+# ซึ่งเป็นข้อจำกัดของแพลตฟอร์ม ไม่ใช่ของโค้ดส่วนนี้
 import datetime
 import hashlib
 import json
@@ -283,11 +277,9 @@ def save_last_signals(universe: str, mapping: dict) -> None:
 # ════════════════════════════════════════════════════════
 # [merged from lib/universes.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — UNIVERSE FETCHERS
-ย้ายมาจาก v2.0 ตรงๆ ไม่มีบั๊กในส่วนนี้ที่ต้องแก้ไข เปลี่ยนแค่ตำแหน่งไฟล์
-เพื่อให้ app.py หลักไม่ต้องยาว 1,500+ บรรทัดในไฟล์เดียว
-"""
+# MODULE — UNIVERSE FETCHERS
+# ย้ายมาจาก v2.0 ตรงๆ ไม่มีบั๊กในส่วนนี้ที่ต้องแก้ไข เปลี่ยนแค่ตำแหน่งไฟล์
+# เพื่อให้ app.py หลักไม่ต้องยาว 1,500+ บรรทัดในไฟล์เดียว
 import streamlit as st
 import pandas as pd
 
@@ -444,11 +436,9 @@ def resolve_tickers(universe: str, sector_choice: list, custom_input: str) -> li
 # ════════════════════════════════════════════════════════
 # [merged from lib/indicators.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — MATH ENGINE
-ทุกฟังก์ชันเหมือน v2.0 เดิม ยกเว้น relative_strength() ที่แก้บั๊กการเทียบวันที่
-(ดู docstring ของฟังก์ชันนั้นสำหรับรายละเอียด)
-"""
+# MODULE — MATH ENGINE
+# ทุกฟังก์ชันเหมือน v2.0 เดิม ยกเว้น relative_strength() ที่แก้บั๊กการเทียบวันที่
+# (ดู docstring ของฟังก์ชันนั้นสำหรับรายละเอียด)
 import numpy as np
 import pandas as pd
 
@@ -659,23 +649,21 @@ def conservative_stars(price, e200, rsi, vol20, drawdown) -> str:
 # ════════════════════════════════════════════════════════
 # [merged from lib/analyzer.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — SINGLE TICKER PIPELINE + BATCH PROCESSOR
-
-เปลี่ยนจาก v2.0 (รายละเอียดอยู่ในแต่ละ docstring):
-  1. ดึง fundamentals (.info) แยก cache จากราคา/เทคนิคัล + ดึงรอบเดียว
-     (เดิมยิงทั้ง .fast_info และ .info แยกกัน = 2 network call ต่อ ticker
-     ต่อสแกน ทั้งที่ fundamentals ไม่ได้เปลี่ยนรายวัน)
-  2. dividendYield ใช้ guard ตาม magnitude แทนการ assume format คงที่
-     (Yahoo เคยเปลี่ยน format ของ field นี้มาแล้ว — เห็นได้จาก GitHub issues
-     หลายอันใน ranaroussi/yfinance — โค้ดเดิมคูณ 100 เสมอ ถ้า field เปลี่ยน
-     มาเป็น % อยู่แล้วจะได้ yield ผิดเพี้ยนไปมาก)
-  3. retry + exponential backoff ทุก network call (เดิมไม่มี retry เลย)
-  4. batch_scan ใช้ ThreadPoolExecutor ยิง concurrent (เดิม sequential
-     ทีละตัว + sleep คงที่ — ช้าและไม่จำเป็น เพราะงานนี้เป็น I/O-bound)
-  5. relative_strength เรียกด้วยซีรีส์ที่มี date index จริง (ดู indicators.py)
-     แทนการส่ง tuple ของค่าดิบที่ไม่มีวันที่กำกับ
-"""
+# MODULE — SINGLE TICKER PIPELINE + BATCH PROCESSOR
+# 
+# เปลี่ยนจาก v2.0 (รายละเอียดอยู่ในแต่ละ docstring):
+#   1. ดึง fundamentals (.info) แยก cache จากราคา/เทคนิคัล + ดึงรอบเดียว
+#      (เดิมยิงทั้ง .fast_info และ .info แยกกัน = 2 network call ต่อ ticker
+#      ต่อสแกน ทั้งที่ fundamentals ไม่ได้เปลี่ยนรายวัน)
+#   2. dividendYield ใช้ guard ตาม magnitude แทนการ assume format คงที่
+#      (Yahoo เคยเปลี่ยน format ของ field นี้มาแล้ว — เห็นได้จาก GitHub issues
+#      หลายอันใน ranaroussi/yfinance — โค้ดเดิมคูณ 100 เสมอ ถ้า field เปลี่ยน
+#      มาเป็น % อยู่แล้วจะได้ yield ผิดเพี้ยนไปมาก)
+#   3. retry + exponential backoff ทุก network call (เดิมไม่มี retry เลย)
+#   4. batch_scan ใช้ ThreadPoolExecutor ยิง concurrent (เดิม sequential
+#      ทีละตัว + sleep คงที่ — ช้าและไม่จำเป็น เพราะงานนี้เป็น I/O-bound)
+#   5. relative_strength เรียกด้วยซีรีส์ที่มี date index จริง (ดู indicators.py)
+#      แทนการส่ง tuple ของค่าดิบที่ไม่มีวันที่กำกับ
 import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Optional
@@ -895,26 +883,24 @@ def fetch_live(ticker: str) -> dict:
 # ════════════════════════════════════════════════════════
 # [merged from lib/backtest.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — BACKTESTER
-
-เปลี่ยนจาก v2.0:
-  1. เข้าซื้อที่ "ราคาเปิดของแท่งถัดไป" (i+1) ไม่ใช่ "ราคาปิดของแท่งที่เกิด
-     สัญญาณ" (i) — เดิมใช้ close ของแท่งเดียวกับที่คำนวณสัญญาณ ซึ่งในทาง
-     ปฏิบัติเทรดจริงทำไม่ได้ (รู้ว่าสัญญาณเกิดก็ต่อเมื่อแท่งนั้นปิดแล้ว)
-  2. เพิ่ม Buy & Hold ของหุ้นตัวเดียวกัน ช่วงเวลาเดียวกัน เป็น benchmark
-     เทียบ — เดิมดู win rate ลอยๆ ไม่รู้ว่ากลยุทธ์ดีกว่า "ถือเฉยๆ" จริงไหม
-  3. เพิ่ม Max Drawdown (จาก equity curve ของ trade ที่ compound ต่อกัน)
-     และ Sharpe ratio แบบประมาณการจาก distribution ของ trade returns
-  4. ระบุข้อจำกัดของ backtest นี้ตรงๆ ในผลลัพธ์ (ดู key "notes")
-
-ข้อจำกัดที่ยังมีอยู่ (ไม่ได้ทำให้ backtest นี้สมบูรณ์แบบ บอกตรงๆ):
-  • ไม่หักค่าคอมมิชชั่น/สเปรด/สลิปเพจ
-  • ทดสอบบนหุ้นที่ "ยังอยู่ใน index วันนี้" เท่านั้น → survivorship bias
-  • Sharpe คำนวณจาก distribution ของ trade returns ไม่ใช่ daily returns
-    แบบเข้มงวด ถือเป็นค่าประมาณ ไม่ใช่ Sharpe ที่ใช้เทียบกับกองทุนจริงได้
-  • กลยุทธ์เดียว ผลย้อนหลังไม่ใช่การันตีผลในอนาคต ไม่ใช่คำแนะนำการลงทุน
-"""
+# MODULE — BACKTESTER
+# 
+# เปลี่ยนจาก v2.0:
+#   1. เข้าซื้อที่ "ราคาเปิดของแท่งถัดไป" (i+1) ไม่ใช่ "ราคาปิดของแท่งที่เกิด
+#      สัญญาณ" (i) — เดิมใช้ close ของแท่งเดียวกับที่คำนวณสัญญาณ ซึ่งในทาง
+#      ปฏิบัติเทรดจริงทำไม่ได้ (รู้ว่าสัญญาณเกิดก็ต่อเมื่อแท่งนั้นปิดแล้ว)
+#   2. เพิ่ม Buy & Hold ของหุ้นตัวเดียวกัน ช่วงเวลาเดียวกัน เป็น benchmark
+#      เทียบ — เดิมดู win rate ลอยๆ ไม่รู้ว่ากลยุทธ์ดีกว่า "ถือเฉยๆ" จริงไหม
+#   3. เพิ่ม Max Drawdown (จาก equity curve ของ trade ที่ compound ต่อกัน)
+#      และ Sharpe ratio แบบประมาณการจาก distribution ของ trade returns
+#   4. ระบุข้อจำกัดของ backtest นี้ตรงๆ ในผลลัพธ์ (ดู key "notes")
+# 
+# ข้อจำกัดที่ยังมีอยู่ (ไม่ได้ทำให้ backtest นี้สมบูรณ์แบบ บอกตรงๆ):
+#   • ไม่หักค่าคอมมิชชั่น/สเปรด/สลิปเพจ
+#   • ทดสอบบนหุ้นที่ "ยังอยู่ใน index วันนี้" เท่านั้น → survivorship bias
+#   • Sharpe คำนวณจาก distribution ของ trade returns ไม่ใช่ daily returns
+#     แบบเข้มงวด ถือเป็นค่าประมาณ ไม่ใช่ Sharpe ที่ใช้เทียบกับกองทุนจริงได้
+#   • กลยุทธ์เดียว ผลย้อนหลังไม่ใช่การันตีผลในอนาคต ไม่ใช่คำแนะนำการลงทุน
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -1007,10 +993,8 @@ def backtest(ticker: str, hold_days: int = 20) -> dict:
 # ════════════════════════════════════════════════════════
 # [merged from lib/styles.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — STYLES & UI HELPERS
-ย้ายมาจาก v2.0 ตรงๆ (CSS theme, dataframe style functions, info_card)
-"""
+# MODULE — STYLES & UI HELPERS
+# ย้ายมาจาก v2.0 ตรงๆ (CSS theme, dataframe style functions, info_card)
 import streamlit as st
 
 CSS_BLOCK = """
@@ -1267,7 +1251,7 @@ def info_card(label: str, value: str, color="#ffffff", sub="") -> str:
 # ════════════════════════════════════════════════════════
 # [merged from lib/tv_chart.py]
 # ════════════════════════════════════════════════════════
-"""MODULE — TRADINGVIEW WIDGET (relocated unchanged from v2.0)"""
+# MODULE — TRADINGVIEW WIDGET (relocated unchanged from v2.0)
 
 
 def tv_chart(ticker: str, height: int = 620, interval: str = "D") -> None:
@@ -1303,7 +1287,7 @@ def tv_chart(ticker: str, height: int = 620, interval: str = "D") -> None:
 # ════════════════════════════════════════════════════════
 # [merged from lib/sector_view.py]
 # ════════════════════════════════════════════════════════
-"""MODULE — SECTOR HEATMAP (เหมือน v2.0 logic เดิม ย้ายมาไว้แยกไฟล์)"""
+# MODULE — SECTOR HEATMAP (เหมือน v2.0 logic เดิม ย้ายมาไว้แยกไฟล์)
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -1356,18 +1340,16 @@ def sector_heatmap_data() -> pd.DataFrame:
 # ════════════════════════════════════════════════════════
 # [merged from lib/alerts.py]
 # ════════════════════════════════════════════════════════
-"""
-MODULE — ALERTS (ใหม่ใน v3.0)
-
-ฟีเจอร์ที่ขอเพิ่ม "แจ้งเตือน" ทำเป็น 2 ชั้น:
-  1. ในแอปเอง (ไม่ต้องตั้งค่าอะไรเพิ่ม) — เทียบสัญญาณของสแกนรอบนี้กับ
-     สแกนรอบล่าสุดที่บันทึกไว้ (cache_store.load_last_signals) แล้วโชว์ว่า
-     มีหุ้นไหนเพิ่ง "กลายเป็น Strong Buy / Breakout" ตั้งแต่รอบก่อน
-  2. Telegram push (ออปชันแล้วแต่ผู้ใช้) — ถ้าตั้งค่า secrets
-     TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ไว้ใน .streamlit/secrets.toml
-     ระบบจะส่งข้อความแจ้งเตือนออกไปด้วย ถ้าไม่ตั้งค่าไว้ ฟังก์ชันจะ no-op
-     เงียบๆ ไม่ error และไม่บังคับให้ต้องมี Bot
-"""
+# MODULE — ALERTS (ใหม่ใน v3.0)
+# 
+# ฟีเจอร์ที่ขอเพิ่ม "แจ้งเตือน" ทำเป็น 2 ชั้น:
+#   1. ในแอปเอง (ไม่ต้องตั้งค่าอะไรเพิ่ม) — เทียบสัญญาณของสแกนรอบนี้กับ
+#      สแกนรอบล่าสุดที่บันทึกไว้ (cache_store.load_last_signals) แล้วโชว์ว่า
+#      มีหุ้นไหนเพิ่ง "กลายเป็น Strong Buy / Breakout" ตั้งแต่รอบก่อน
+#   2. Telegram push (ออปชันแล้วแต่ผู้ใช้) — ถ้าตั้งค่า secrets
+#      TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID ไว้ใน .streamlit/secrets.toml
+#      ระบบจะส่งข้อความแจ้งเตือนออกไปด้วย ถ้าไม่ตั้งค่าไว้ ฟังก์ชันจะ no-op
+#      เงียบๆ ไม่ error และไม่บังคับให้ต้องมี Bot
 from typing import Optional
 
 import pandas as pd
