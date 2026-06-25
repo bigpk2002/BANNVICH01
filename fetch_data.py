@@ -14,6 +14,9 @@
 import datetime
 import json
 import os
+import time
+
+import pandas as pd
 
 import app  # ดึง analyze / batch_scan / resolve_tickers / UNIVERSE_OPTIONS / SECTOR_MAP
             # / make_bench_tuple / NOTABLE_SIGNALS มาใช้ตรงจาก app.py (ไม่ duplicate logic)
@@ -96,13 +99,27 @@ def main():
     except Exception as e:
         print(f"ดึง SPY benchmark ไม่สำเร็จ ({e}) — จะสแกนต่อโดยไม่มี Relative Strength")
 
-    def progress(done, total):
-        if done % 100 == 0 or done == total:
-            print(f"  ...สแกนแล้ว {done}/{total}")
+    # v3.3: เดิมยิงทั้งหมดทีเดียวด้วย max_workers=8 — จาก log การรันจริงพบว่า
+    # Yahoo เริ่ม Rate-limit (YFRateLimitError) หลังยิงต่อเนื่องสักพัก ทำให้
+    # หุ้นท้ายๆของ universe ใหญ่หลุดไปจำนวนมาก ตอนนี้แบ่งเป็น chunk เล็กลง +
+    # ใช้ concurrency ต่อ chunk ต่ำลง + พักระหว่าง chunk ให้ Yahoo "หายใจ"
+    # ช้าลงแต่ได้ข้อมูลครบกว่าเดิมมาก — งานนี้ไม่มีคนรอ ไม่ต้องรีบ
+    CHUNK_SIZE = 60
+    PAUSE_BETWEEN_CHUNKS = 5  # วินาที
 
-    df = app.batch_scan(tuple(all_tickers), "1y", "1d", bench_tuple,
-                         max_workers=8, progress_cb=progress)
-    print(f"สแกนสำเร็จ {len(df)} / {len(all_tickers)} ตัว (ที่เหลือคือดึงไม่สำเร็จ/rate-limit ชั่วคราว — รอบหน้าจะลองใหม่)")
+    all_dfs = []
+    total = len(all_tickers)
+    for i in range(0, total, CHUNK_SIZE):
+        chunk = all_tickers[i:i + CHUNK_SIZE]
+        chunk_df = app.batch_scan(tuple(chunk), "1y", "1d", bench_tuple, max_workers=4)
+        all_dfs.append(chunk_df)
+        done = min(i + CHUNK_SIZE, total)
+        print(f"  ...สแกนแล้ว {done}/{total} (chunk นี้ได้ {len(chunk_df)}/{len(chunk)} ตัว)")
+        if done < total:
+            time.sleep(PAUSE_BETWEEN_CHUNKS)
+
+    df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+    print(f"สแกนสำเร็จ {len(df)} / {len(all_tickers)} ตัว (ที่เหลือคือดึงไม่สำเร็จ/delisted/rate-limit ชั่วคราว — รอบหน้าจะลองใหม่)")
 
     if df.empty:
         print("ผลลัพธ์ว่างเปล่าทั้งหมด — ไม่บันทึกทับไฟล์เดิม (กันข้อมูลเก่าหายเปล่าๆ)")
