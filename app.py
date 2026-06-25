@@ -68,9 +68,13 @@ def log_err(context: str, e: Exception) -> None:
 def retry(times: int = 3, base_delay: float = 0.6, exceptions=(Exception,)):
     """
     Decorator: ลองใหม่แบบ exponential backoff + jitter เมื่อ network call ล่ม
-    ชั่วคราว (เช่น Yahoo ตอบ 429 / timeout ที่เกิดขึ้นบ่อยบน Streamlit Cloud
-    เพราะ IP เป็น shared IP กับแอปอื่น) ไม่ได้การันตีว่าจะไม่โดนบล็อกอีก
-    แต่ลดอัตราที่ "1 ครั้งพัง = หุ้นหายจากผลสแกนทันที" ลงไปมาก
+    ชั่วคราว (เช่น Yahoo ตอบ 429 / timeout)
+
+    v3.3: เพิ่ม backoff แบบยาวเป็นพิเศษเฉพาะ error ที่เป็น rate-limit จริงๆ
+    (เห็นจาก log การรันจริงบน GitHub Actions ว่า "Too Many Requests" เกิดขึ้น
+    เป็นชุดต่อเนื่องหลังยิง request รัวๆ — backoff สั้นแบบเดิม (<2 วินาทีรวม)
+    ไม่พอให้ Yahoo คลายการบล็อก ลองใหม่กี่ครั้งก็ยังโดนซ้ำ) ตอนนี้ถ้า error
+    message มีคำว่า rate limit ชัดๆ จะรอยาวขึ้นมาก (8s, 16s, 32s...) แทน
     """
     def deco(fn):
         @wraps(fn)
@@ -82,7 +86,13 @@ def retry(times: int = 3, base_delay: float = 0.6, exceptions=(Exception,)):
                 except exceptions as e:
                     last_exc = e
                     if attempt < times - 1:
-                        delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3)
+                        msg = str(e)
+                        is_rate_limit = ("Rate limit" in msg or "Too Many Requests" in msg
+                                         or "429" in msg or "RateLimitError" in type(e).__name__)
+                        if is_rate_limit:
+                            delay = 8 * (2 ** attempt) + random.uniform(0, 2)
+                        else:
+                            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.3)
                         time.sleep(delay)
             raise last_exc
         return wrapper
@@ -287,16 +297,46 @@ import pandas as pd
 
 @st.cache_data(ttl=86400)
 def fetch_sp500():
+    """
+    v3.3: Wikipedia บล็อก request จาก IP ของ cloud/datacenter (รวม GitHub
+    Actions runner) ด้วย 403 Forbidden แบบไม่สนใจ User-Agent — ยืนยันจาก log
+    การรันจริง ตอนนี้ใช้ CSV ที่ดูแลโดยชุมชน (datasets/s-and-p-500-companies
+    บน GitHub ซึ่งโฮสต์ผ่าน raw.githubusercontent.com ไม่ถูกบล็อกแบบเดียวกัน)
+    เป็นแหล่งหลัก แล้วค่อย fallback ไป Wikipedia (เผื่อรันจาก IP ที่ไม่ถูกบล็อก
+    เช่น เครื่องคุณเอง) แล้ว fallback สุดท้ายเป็น list สั้นๆกันพังทั้งหมด
+    """
+    try:
+        import requests
+        url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        from io import StringIO
+        df = pd.read_csv(StringIO(resp.text))
+        col = "Symbol" if "Symbol" in df.columns else df.columns[0]
+        tickers = sorted([str(s).strip().replace(".", "-") for s in df[col].dropna()])
+        if len(tickers) > 400:
+            return tickers
+    except Exception as e:
+        log_err("fetch_sp500(github-csv)", e)
+
     try:
         t = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")[0]
         return sorted([s.replace(".", "-") for s in t["Symbol"].tolist()])
     except Exception as e:
-        log_err("fetch_sp500", e)
-        return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "PG"]
+        log_err("fetch_sp500(wikipedia)", e)
+        return ["AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "JPM", "V", "PG",
+                "UNH", "JNJ", "XOM", "WMT", "MA", "HD", "CVX", "MRK", "ABBV", "KO",
+                "PEP", "BAC", "AVGO", "COST", "TMO", "MCD", "CSCO", "ACN", "ABT", "DHR",
+                "LIN", "ADBE", "CRM", "NFLX", "TXN", "NEE", "PM", "WFC", "RTX", "ORCL",
+                "AMD", "QCOM", "UPS", "INTC", "HON", "UNP", "LOW", "IBM", "AMGN", "SBUX"]
 
 
 @st.cache_data(ttl=86400)
 def fetch_nasdaq100():
+    """v3.3: Wikipedia 403 บล็อกจาก cloud IP เหมือนกับ fetch_sp500 — ยังไม่เจอ
+    CSV ทางเลือกที่ verified ว่าเสถียรพอสำหรับ index นี้โดยเฉพาะ จึงพยายาม
+    ดึงจาก Wikipedia ก่อน (อาจสำเร็จถ้ารันจาก IP ที่ไม่ถูกบล็อก) แล้ว fallback
+    เป็น list ที่ใหญ่ขึ้นมาก (~95 ตัว เทียบจาก 10 ตัวเดิม) ถ้าดึงไม่ได้จริงๆ"""
     try:
         tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
         for t in tables:
@@ -307,8 +347,18 @@ def fetch_nasdaq100():
                 if len(tk) > 50:
                     return sorted(tk)
     except Exception as e:
-        log_err("fetch_nasdaq100", e)
-    return ["AAPL", "MSFT", "AMZN", "NVDA", "META", "GOOGL", "TSLA", "AVGO", "COST", "CSCO"]
+        log_err("fetch_nasdaq100(wikipedia)", e)
+    return sorted(["AAPL","MSFT","AMZN","NVDA","GOOGL","GOOG","META","TSLA","AVGO","COST",
+        "NFLX","AMD","PEP","ADBE","CSCO","TMUS","INTC","CMCSA","QCOM","TXN",
+        "AMAT","INTU","ISRG","HON","AMGN","BKNG","VRTX","SBUX","MDLZ","GILD",
+        "ADI","REGN","PANW","LRCX","MU","PYPL","SNPS","CDNS","KLAC","MAR",
+        "ORLY","CTAS","ASML","ABNB","MRVL","FTNT","CRWD","ADSK","NXPI","MNST",
+        "PCAR","ROST","PAYX","KDP","ODFL","AEP","EXC","IDXX","FAST","EA",
+        "CSGP","CPRT","DXCM","BIIB","GEHC","ON","MCHP","WBD","ANSS","TTD",
+        "CCEP","DASH","MDB","TEAM","ZS","GFS","ILMN","WDAY","VRSK","CTSH",
+        "BKR","XEL","DDOG","CDW","FANG","CHTR","LULU","MELI","EBAY","KHC",
+        "TTWO","ALGN","ARM","APP","AXON","DECK","PLTR","CSX","GEN","LIN"])
+
 
 
 @st.cache_data(ttl=86400)
@@ -719,6 +769,18 @@ def _download_info(ticker: str) -> dict:
     return yf.Ticker(ticker).info or {}
 
 
+def _safe_num(val, decimals=2):
+    """แปลงค่าเป็น float อย่างปลอดภัย — เคยพบว่า field บางตัวจาก Yahoo (เช่น P/E
+    ของ BILL) คืนมาเป็น string แทนตัวเลข ทำให้ round() พังทั้งฟังก์ชันและ field
+    อื่นที่ดีอยู่แล้วก็พลอยหายไปด้วย (v3.3 แก้ — เช็คทีละ field แทน)"""
+    if val is None:
+        return np.nan
+    try:
+        return round(float(val), decimals)
+    except (TypeError, ValueError):
+        return np.nan
+
+
 @st.cache_data(ttl=21600)  # 6 ชม. — fundamentals เปลี่ยนช้ากว่าราคามาก ไม่ต้องดึงซ้ำทุกสแกน
 def _cached_fundamentals(ticker: str) -> dict:
     try:
@@ -726,11 +788,12 @@ def _cached_fundamentals(ticker: str) -> dict:
         pe = info.get("trailingPE") or info.get("forwardPE")
         pb = info.get("priceToBook")
         mktcap = info.get("marketCap")
+        mktcap_b = (mktcap / 1e9) if isinstance(mktcap, (int, float)) else np.nan
         return {
-            "pe": round(pe, 2) if pe else np.nan,
-            "pb": round(pb, 2) if pb else np.nan,
+            "pe": _safe_num(pe),
+            "pb": _safe_num(pb),
             "div": _normalize_dividend_yield(info.get("dividendYield")),
-            "mktcap_b": round(mktcap / 1e9, 2) if mktcap else np.nan,
+            "mktcap_b": _safe_num(mktcap_b),
         }
     except Exception as e:
         log_err(f"fundamentals({ticker})", e)
