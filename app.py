@@ -1,19 +1,22 @@
 # ╔══════════════════════════════════════════════════════════════╗
-# ║   INSTITUTIONAL STOCK SCREENER  —  v3.1 (single-file)        ║
-# ║   เหมือน v3.0 ทุกจุด (แก้ความแม่นยำ/ความเร็ว/backtest/         ║
-# ║   alert+watchlist persist) แต่รวมกลับมาเป็นไฟล์เดียว           ║
-# ║   เพื่อให้ deploy ง่ายแบบเดิม — แทนที่ app.py ไฟล์เดียว จบ       ║
+# ║   INSTITUTIONAL STOCK SCREENER  —  v3.4 (single-file)        ║
+# ║   ข้อมูลหลักดึงอัตโนมัติวันละครั้งหลังตลาดปิด ผ่าน GitHub        ║
+# ║   Action (ดู fetch_data.py + .github/workflows/prefetch.yml)  ║
 # ╚══════════════════════════════════════════════════════════════╝
-# สรุปการเปลี่ยนแปลงจาก v2.0 เดิม (รายละเอียดเต็มอยู่ใน docstring/comment
+# สรุปการเปลี่ยนแปลงสะสมจาก v2.0 เดิม (รายละเอียดเต็มอยู่ใน docstring/comment
 # ของแต่ละฟังก์ชันด้านล่าง):
 #   1. ความแม่นยำ: แก้บั๊ก relative_strength เทียบ "ตำแหน่ง" ข้ามตลาดที่ปฏิทิน
 #      วันเทรดต่างกัน (หุ้นไทย .BK vs SPY) + guard format ของ dividendYield
 #   2. ความเร็ว/เสถียร: ลด network call ต่อ ticker, แยก cache fundamentals
-#      ออกจาก cache ราคา, เพิ่ม retry+backoff, สแกนแบบ concurrent
+#      ออกจาก cache ราคา, เพิ่ม retry+backoff (แยก backoff ยาวพิเศษสำหรับ
+#      rate-limit โดยเฉพาะ), ดึง S&P500 จาก GitHub CSV แทน Wikipedia (403)
 #   3. Backtest: เข้าซื้อที่ open แท่งถัดไป (ไม่ lookahead), เทียบ Buy&Hold,
 #      เพิ่ม Max Drawdown และ Sharpe โดยประมาณ
 #   4. ฟีเจอร์ใหม่: watchlist persist ข้าม session จริง (เซฟลง disk) +
 #      แจ้งเตือนสัญญาณใหม่ (in-app + Telegram แบบออปชัน)
+#   5. Prefetch architecture (v3.2-3.4): แยก "ดึงข้อมูล" กับ "ดู" ออกจากกัน
+#      สมบูรณ์ — fetch_data.py รันผ่าน GitHub Action วันละครั้งหลังตลาด
+#      สหรัฐฯ+ไทยปิดทั้งคู่ แอปแค่อ่านไฟล์ที่ดึงไว้แล้ว ไม่ยิง Yahoo ตอนคนดูเลย
 import datetime
 import hashlib
 import json
@@ -666,21 +669,32 @@ def gem_score(pat_score, acc_score, vol20, rsi, drawdown, mktcap_b) -> tuple:
     return s, lbl
 
 
-def strategy_signal(price, e200, e50, rsi, vol20, macd_h, stars) -> str:
+def strategy_signal(price, e200, e50, rsi, vol20, macd_h, stars) -> tuple:
+    """
+    v3.4: เดิมคืนแค่ label เฉยๆ (เช่น "🔥 Strong Buy") คนต้องกดเข้า Deep Dive
+    ไปดูตัวเลข RSI/Vol/MACD แยกทีละหุ้นเองว่าทำไมได้สัญญาณนี้ ตอนนี้คืน
+    เหตุผลสั้นๆมาด้วยในตัวเดียวกัน เอาไปโชว์ในตารางหลักได้ตรงๆ ไม่ต้องเดา
+
+    ย้ำ: เงื่อนไขด้านล่างเป็น threshold ที่ตั้งเองตามหลักการวิเคราะห์เทคนิคัล
+    ทั่วไป (RSI, Volume, MACD) ไม่ได้ผ่านการ backtest แยกทีละสัญญาณว่าให้ผล
+    ตอบแทนจริงดีกว่าสุ่มหรือไม่ — เป็น heuristic ไม่ใช่โมเดลที่พิสูจน์ทางสถิติ
+    """
     p200 = (price - e200) / e200 * 100 if e200 > 0 else 999
     if len(stars) >= 3 and rsi < 40 and vol20 > 1.8 and macd_h > 0 and -5 <= p200 <= 3:
-        return "🔥 Strong Buy"
+        return "🔥 Strong Buy", f"RSI ต่ำ ({rsi:.0f}) + Volume สูง ({vol20:.1f}x) + MACD เป็นบวก + ใกล้ EMA200"
     if vol20 > 2.0 and price > e50 > e200 and macd_h > 0 and 50 <= rsi <= 75:
-        return "🚀 Breakout"
+        return "🚀 Breakout", f"Volume พุ่ง ({vol20:.1f}x) + ราคา>EMA50>EMA200 + MACD เป็นบวก"
     if price > e50 > e200 and 40 <= rsi <= 70:
-        return "📈 ขาขึ้น"
+        return "📈 ขาขึ้น", f"ราคา>EMA50>EMA200 เรียงตัวสวย + RSI ปกติ ({rsi:.0f})"
     if abs(p200) <= 3 and rsi < 50 and macd_h < 0:
-        return "⚠️ เฝ้าระวัง"
+        return "⚠️ เฝ้าระวัง", f"ราคาใกล้ EMA200 แต่ MACD เป็นลบ + RSI<50 ({rsi:.0f}) — ทิศทางยังไม่ชัด"
     if rsi > 75:
-        return "⏳ รอ Pullback"
+        return "⏳ รอ Pullback", f"RSI สูงมาก ({rsi:.0f}) ซื้อตามนี้เสี่ยงไล่ราคา"
     if price < e200:
-        return "⚠️ Oversold Bear" if rsi < 30 else "❌ ขาลง"
-    return "🔄 Neutral"
+        if rsi < 30:
+            return "⚠️ Oversold Bear", f"ราคา<EMA200 และ RSI<30 ({rsi:.0f}) — oversold แต่เทรนด์หลักยังลง"
+        return "❌ ขาลง", "ราคาต่ำกว่า EMA200 — เทรนด์หลักเป็นขาลง"
+    return "🔄 Neutral", "ไม่เข้าเงื่อนไขสัญญาณชัดเจนข้อใดข้อหนึ่ง"
 
 
 def conservative_stars(price, e200, rsi, vol20, drawdown) -> str:
@@ -841,7 +855,7 @@ def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=N
         trend = "🟢 Bull" if px > ep[200] else "🔴 Bear"
         patt = candle_pattern(df)
         stars = conservative_stars(px, ep[200], rsi_val, vm20 or 0, draw or 0)
-        sig = strategy_signal(px, ep[200], ep[50], rsi_val, vm20 or 0, mh, stars)
+        sig, sig_reason = strategy_signal(px, ep[200], ep[50], rsi_val, vm20 or 0, mh, stars)
 
         ep_lbl, ep_sc = ema_pattern(px, ep[5], ep[10], ep[20], ep[50], ep[100], ep[200])
         acc_sc, acc_lb = quiet_accumulation(vl, cl, rsi_val)
@@ -860,7 +874,7 @@ def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=N
 
         return {
             "Ticker": ticker, "Price": round(px, 2), "ราคาปิด": prev_c,
-            "Trend": trend, "Signal": sig, "Phase": ep_lbl, "Stars": stars,
+            "Trend": trend, "Signal": sig, "Signal Reason": sig_reason, "Phase": ep_lbl, "Stars": stars,
             "EMA5": round(ep[5], 2), "EMA10": round(ep[10], 2), "EMA20": round(ep[20], 2),
             "EMA50": round(ep[50], 2), "EMA100": round(ep[100], 2), "EMA200": round(ep[200], 2),
             "vs EMA5%": ed[5], "vs EMA10%": ed[10], "vs EMA20%": ed[20],
@@ -1467,7 +1481,7 @@ ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "
 @st.cache_data(ttl=300)
 def load_prefetched_bundle():
     """
-    อ่านไฟล์ data/latest_scan.json ที่ GitHub Actions ดึงไว้ล่วงหน้าทุก 4 ชม.
+    อ่านไฟล์ data/latest_scan.json ที่ GitHub Actions ดึงไว้ล่วงหน้าทุกวันหลังตลาดปิด
     (ใหม่ v3.2) — เปลี่ยนจาก v3.0/3.1 ที่ต้องรอให้มีคนกด Run Screener ก่อน
     ถึงจะมีข้อมูล ตอนนี้ "การดึงข้อมูล" กับ "การดู" แยกกันคนละจุดสมบูรณ์ ไฟล์นี้
     ถูกเขียนโดย fetch_data.py (รันจาก GitHub Action) ไม่ใช่จากแอปตัวนี้เอง
@@ -1584,12 +1598,12 @@ def main():
                                 help="เฉพาะตอนกด Run สแกนสดด้วยตัวเอง — ต้องตั้ง "
                                      "TELEGRAM_BOT_TOKEN และ TELEGRAM_CHAT_ID ใน "
                                      ".streamlit/secrets.toml ก่อน ถ้าไม่ตั้งจะไม่มีผลอะไร "
-                                     "(ส่วนการแจ้งเตือนของรอบ prefetch อัตโนมัติทุก 4 ชม. "
+                                     "(ส่วนการแจ้งเตือนของรอบ prefetch อัตโนมัติทุกวันหลังตลาดปิด "
                                      "ตั้งค่าแยกที่ GitHub Action ไม่เกี่ยวกับติ๊กนี้)")
 
         st.markdown("---")
         run_btn = st.button("🚀 Run Screener | สแกนสดเดี๋ยวนี้", use_container_width=True,
-                            help="ปกติไม่ต้องกดเลย — ข้อมูลมาจากรอบดึงอัตโนมัติทุก 4 ชม. อยู่แล้ว "
+                            help="ปกติไม่ต้องกดเลย — ข้อมูลมาจากรอบดึงอัตโนมัติทุกวันหลังตลาดปิด อยู่แล้ว "
                                  "กดปุ่มนี้เฉพาะตอนอยากได้ข้อมูลสดเดี๋ยวนี้ ไม่รอรอบถัดไป")
 
         with st.expander("💾 Export | ส่งออกข้อมูล"):
@@ -1603,7 +1617,7 @@ def main():
 
         with st.expander("🗑️ ล้าง Cache (เฉพาะของสแกนสด/manual)"):
             st.caption("ใช้ลบเฉพาะ cache ของการกด 'Run Screener' สแกนสดเอง "
-                      "ไม่กระทบข้อมูล prefetch อัตโนมัติทุก 4 ชม. (อันนั้นอัปเดตเองจาก GitHub Action)")
+                      "ไม่กระทบข้อมูล prefetch อัตโนมัติทุกวันหลังตลาดปิด (อันนั้นอัปเดตเองจาก GitHub Action)")
             if st.button("ล้าง Cache ของ Universe นี้", use_container_width=True):
                 tickers_for_clear = resolve_tickers(universe, sector_choice, custom_input)[:max_tk]
                 if clear_cache_for(universe, tuple(tickers_for_clear), period, interval):
@@ -1613,7 +1627,7 @@ def main():
 
         st.markdown("---")
         st.markdown(f"<p style='color:#7d8590;font-size:0.72rem;'>Data: Yahoo Finance<br>"
-                    f"ข้อมูลหลัก: ดึงอัตโนมัติทุก 4 ชม. ผ่าน GitHub Action<br>"
+                    f"ข้อมูลหลัก: ดึงอัตโนมัติทุกวันหลังตลาดปิด ผ่าน GitHub Action<br>"
                     f"Watchlist: {len(st.session_state.watchlist)} หุ้น (persist ข้าม session)</p>",
                     unsafe_allow_html=True)
 
@@ -1625,7 +1639,7 @@ def main():
     bundle_gen_at = None
     new_signal_hits = []
 
-    # ── Run screener (กดเอง = สแกนสดตอนนี้เลย ไม่รอรอบ prefetch ทุก 4 ชม.) ──
+    # ── Run screener (กดเอง = สแกนสดตอนนี้เลย ไม่รอรอบ prefetch ทุกวันหลังตลาดปิด) ──
     if run_btn:
         bench_tuple = None
         if use_rs:
@@ -1657,10 +1671,10 @@ def main():
                 f"{h['ticker']} {h['signal']}" for h in new_signal_hits[:20])
             maybe_notify_telegram(msg)
 
-    # ── ดีฟอลต์ (ไม่กด Run): อ่านจากข้อมูลที่ดึงไว้ล่วงหน้าทุก 4 ชม. (v3.2 ใหม่) ──
+    # ── ดีฟอลต์ (ไม่กด Run): อ่านจากข้อมูลที่ดึงไว้ล่วงหน้าทุกวันหลังตลาดปิด (v3.2 ใหม่) ──
     # เปลี่ยนจาก v3.0/3.1 ที่ต้องรอให้มีคนกด Run ก่อนถึงจะมีข้อมูล — ตอนนี้แอป
     # ไม่ได้ไปคุยกับ Yahoo ตอนคนเข้าดูเลย แค่อ่านไฟล์ที่ fetch_data.py
-    # (รันจาก GitHub Action ทุก 4 ชม.) เตรียมไว้ให้แล้ว
+    # (รันจาก GitHub Action ทุกวันหลังตลาดปิด) เตรียมไว้ให้แล้ว
     else:
         bundle_gen_at, bundle_df = load_prefetched_bundle()
         if bundle_gen_at:
@@ -1685,7 +1699,7 @@ def main():
             st.markdown(
                 f'<div style="background:#1c2128;border:1px solid #30363d;border-radius:8px;'
                 f'padding:8px 14px;margin-bottom:10px;display:flex;align-items:center;gap:10px;">'
-                f'<span style="color:#3fb950;font-size:0.85rem;">⚡ ข้อมูลล่วงหน้า — อัปเดตอัตโนมัติทุก 4 ชม.</span>'
+                f'<span style="color:#3fb950;font-size:0.85rem;">⚡ ข้อมูลล่วงหน้า — อัปเดตอัตโนมัติทุกวันหลังตลาดปิด</span>'
                 f'<span style="color:#8b949e;font-size:0.8rem;">ดึงล่าสุด {gen_lbl} · {universe} · '
                 f'{len(df)} หุ้น</span>'
                 f'<span style="color:#7d8590;font-size:0.75rem;">— ไม่ต้องรอ ไม่ต้องกด Run</span>'
@@ -1738,7 +1752,7 @@ def main():
             <div style="text-align:center;padding:80px 0;color:#8b949e;">
                 <div style="font-size:3rem;">📊</div>
                 <h3 style="color:#c9d1d9;">ยังไม่มีข้อมูลล่วงหน้าสำหรับ Universe นี้</h3>
-                <p>ปกติข้อมูลจะโผล่ขึ้นอัตโนมัติ (ดึงทุก 4 ชม.) — ถ้ายังไม่เห็น ลองกด
+                <p>ปกติข้อมูลจะโผล่ขึ้นอัตโนมัติ (ดึงทุกวันหลังตลาดปิด) — ถ้ายังไม่เห็น ลองกด
                 🚀 Run Screener เพื่อดึงสดเองครั้งนี้</p>
             </div>""", unsafe_allow_html=True)
         elif df.empty:
@@ -1761,6 +1775,25 @@ def main():
             cards_html += '</div>'
             st.markdown(cards_html, unsafe_allow_html=True)
 
+            st.caption("⚠️ Signal / 💎 Gem / Accum เป็นการให้คะแนนตามเงื่อนไขเทคนิคัลที่ตั้งไว้เอง "
+                      "(RSI, Volume, MACD, EMA) **ยังไม่ผ่านการพิสูจน์ทางสถิติว่าทำนายผลตอบแทนได้จริง** "
+                      "ดูคอลัมน์ 'เหตุผล' เพื่อรู้ว่าทำไมได้ signal นี้ — ใช้เป็นจุดเริ่มต้นไปวิเคราะห์ต่อ ไม่ใช่คำแนะนำซื้อขาย")
+
+            with st.expander("📖 Signal แต่ละแบบหมายถึงอะไร"):
+                st.markdown("""
+| Signal | ความหมายคร่าวๆ |
+|---|---|
+| 🔥 Strong Buy | RSI ต่ำ + Volume สูง + MACD บวก + ราคาใกล้ EMA200 — เงื่อนไขเข้มที่สุด |
+| 🚀 Breakout | Volume พุ่งแรง + ราคายืนเหนือ EMA50 และ EMA200 |
+| 📈 ขาขึ้น | แนวโน้มขึ้นต่อเนื่อง EMA เรียงตัวสวย |
+| ⚠️ เฝ้าระวัง | ราคาแถว EMA200 แต่โมเมนตัม (MACD) เริ่มอ่อน |
+| ⏳ รอ Pullback | RSI สูงเกินไป มีโอกาสย่อตัวก่อน |
+| ❌ ขาลง / ⚠️ Oversold Bear | ราคาต่ำกว่า EMA200 — เทรนด์หลักเป็นขาลง |
+| 🔄 Neutral | ไม่เข้าเงื่อนไขข้อใดชัดเจน |
+
+ทุก signal คำนวณจาก threshold ที่ตั้งตามหลักการวิเคราะห์เทคนิคัลทั่วไป **ไม่ได้ backtest แยกทีละแบบ** ว่าให้ผลตอบแทนจริงดีกว่าสุ่มหรือไม่ (มีแค่กลยุทธ์ EMA Squeeze ใน tab Backtester ที่ทดสอบแล้วจริง)
+                """)
+
             fc1, fc2, fc3 = st.columns(3)
             with fc1:
                 sig_filter = st.multiselect("Signal | สัญญาณ", df["Signal"].unique().tolist() if "Signal" in df else [],
@@ -1773,9 +1806,12 @@ def main():
                                            default=[], key="d_sq", placeholder="ทั้งหมด")
 
             show_cols = [c for c in ["Ticker", "Price", "ราคาปิด", "Trend", "RSI", "EMA Pattern",
-                                     "Squeeze", "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal", "Stars"]
+                                     "Squeeze", "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal",
+                                     "Signal Reason", "Stars"]
                          if c in df.columns]
             dfv = df[show_cols].copy()
+            if "Signal Reason" in dfv.columns:
+                dfv = dfv.rename(columns={"Signal Reason": "เหตุผล"})
 
             if "Signal Age" in dfv.columns:
                 dfv["Signal Age"] = dfv["Signal Age"].apply(
@@ -1899,6 +1935,12 @@ def main():
 - `🔥 Squeezing` — bandwidth แคบลง → **ยังไม่สาย**
 - `🌱 Just Broke` — เพิ่งเบรค → **รีบตัดสินใจ**
 - `📈 Expanding` — กางออกแล้ว → อาจช้าไปแล้ว
+
+---
+⚠️ **คะแนนทั้งหมดด้านบนเป็น heuristic** (ให้คะแนนตามเงื่อนไขที่ตั้งเอง จากหลักการ
+วิเคราะห์เทคนิคัลทั่วไป) **ไม่ได้ผ่านการ backtest พิสูจน์ทางสถิติ** ว่าหุ้นที่ได้
+คะแนนสูงจะให้ผลตอบแทนจริงดีกว่าหุ้นทั่วไปหรือสุ่มเลือก — ใช้เป็นจุดเริ่มต้น
+ไปวิจัยเพิ่มเติมเอง ไม่ใช่คำแนะนำการลงทุน
                 """)
 
     # ════════════════════════════════════════════════════════
@@ -1932,6 +1974,7 @@ def main():
                 age_now = row.get("Signal Age", -1)
                 age_str = f"{age_now}d ago" if isinstance(age_now, (int, float)) and age_now >= 0 else "—"
                 sig_now = row.get("Signal", "—")
+                sig_reason_now = row.get("Signal Reason", "")
                 rs20_now = row.get("RS 20D", np.nan)
 
                 st.markdown(
@@ -1954,6 +1997,8 @@ def main():
                     f'border-radius:6px;padding:4px 12px;font-size:0.85rem;font-weight:700;">'
                     f'{sig_now}</span>'
                     f'</div>', unsafe_allow_html=True)
+                if sig_reason_now:
+                    st.caption(f"เหตุผล: {sig_reason_now}")
 
                 ema_info = [(5, "#a8b3c5"), (10, "#a8b3c5"), (20, "#f7b731"),
                             (50, "#26c6da"), (100, "#ab7df8"), (200, "#ef5350")]
@@ -2216,12 +2261,16 @@ def main():
             if "wl_df" in st.session_state and not st.session_state["wl_df"].empty:
                 wdf = st.session_state["wl_df"]
                 wl_show = [c for c in ["Ticker", "Price", "Trend", "RSI", "EMA Pattern", "Squeeze",
-                                       "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal", "YTD%", "Drawdown%"]
+                                       "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal", "Signal Reason",
+                                       "YTD%", "Drawdown%"]
                            if c in wdf.columns]
+                wdf = wdf.copy()
                 if "Signal Age" in wdf.columns:
-                    wdf = wdf.copy()
                     wdf["Signal Age"] = wdf["Signal Age"].apply(
                         lambda x: f"{int(x)}d ago" if isinstance(x, (int, float)) and x >= 0 else "—")
+                if "Signal Reason" in wdf.columns:
+                    wdf = wdf.rename(columns={"Signal Reason": "เหตุผล"})
+                    wl_show = [("เหตุผล" if c == "Signal Reason" else c) for c in wl_show]
                 wsmap = {"Signal": _sty_signal, "💎 Gem": _sty_gem, "RSI": _sty_rsi,
                          "Squeeze": _sty_squeeze, "RS 20D": _sty_rs, "Accum": _sty_signal}
                 st.dataframe(make_table(wdf[wl_show], wsmap),
