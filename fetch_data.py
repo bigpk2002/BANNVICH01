@@ -1,6 +1,6 @@
 """
 สคริปต์นี้ไม่ได้ถูกเรียกจากแอป Streamlit ตรงๆ — เป็นตัวที่ GitHub Actions
-รันตามเวลา (ทุก 4 ชม. ดู .github/workflows/prefetch.yml) เพื่อดึงข้อมูลหุ้น
+รันตามเวลา (ทุกวันหลังตลาดปิด ดู .github/workflows/prefetch.yml) เพื่อดึงข้อมูลหุ้น
 ทั้งหมดล่วงหน้า แล้วเซฟเป็นไฟล์ data/latest_scan.json ให้แอป Streamlit
 อ่านตรงๆ แทนการไปยิง Yahoo Finance สดตอนมีคนเข้าดูหน้าเว็บ
 
@@ -149,7 +149,7 @@ def main():
     if new_hits and old_signals:
         # ส่ง Telegram เฉพาะตอนมีของรอบก่อนให้เทียบจริงๆ — รอบแรกสุด (ยังไม่มี
         # ไฟล์เก่าเลย) จะไม่ยิงแจ้งเตือนทั้ง list มาทีเดียว (จะดูเหมือน spam)
-        msg = "🔔 สัญญาณใหม่ (auto-scan ทุก 4 ชม.): " + ", ".join(
+        msg = "🔔 สัญญาณใหม่ (auto-scan ทุกวันหลังตลาดปิด): " + ", ".join(
             f"{h['ticker']} {h['signal']}" for h in new_hits[:25])
         notify_telegram_from_env(msg)
     elif new_hits:
