@@ -26,6 +26,13 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 OUT_PATH = os.path.join(BASE_DIR, "data", "latest_scan.json")
 ALERTS_PATH = os.path.join(BASE_DIR, "data", "alerts.json")
 
+# v3.5: GitHub Actions ตั้ง GITHUB_REPOSITORY ให้อัตโนมัติเป็น "owner/repo"
+# ใช้ดึง URL ของ Release "latest-data" รอบก่อนหน้า (ก่อนรอบนี้จะเขียนทับ)
+# เพราะตอนนี้ไม่ commit ไฟล์เข้า git แล้ว (ย้ายไปเก็บที่ Release กัน repo บวม)
+# ทุกรอบที่ Action รันใหม่จะ checkout repo สดๆไม่มีไฟล์เก่าเหลือในเครื่องอีก
+GITHUB_REPO_ENV = os.environ.get("GITHUB_REPOSITORY")
+RELEASE_TAG = "latest-data"
+
 # Universe ที่จะดึงล่วงหน้าให้ทั้งหมด (ไม่รวม Custom Tickers / Sector Focus
 # เพราะ Sector Focus ใช้ ticker ที่อยู่ใน SECTOR_MAP ซึ่งรวมไว้แยกด้านล่างแล้ว)
 PREFETCH_UNIVERSES = [
@@ -36,6 +43,12 @@ PREFETCH_UNIVERSES = [
     "หุ้นไทย SET/mai",
     "ETF Screener (70)",
 ]
+
+
+def _release_asset_url(filename: str):
+    if not GITHUB_REPO_ENV:
+        return None
+    return f"https://github.com/{GITHUB_REPO_ENV}/releases/download/{RELEASE_TAG}/{filename}"
 
 
 def notify_telegram_from_env(message: str) -> bool:
@@ -57,18 +70,29 @@ def notify_telegram_from_env(message: str) -> bool:
 
 
 def load_old_signals() -> dict:
-    """อ่าน bundle รอบก่อนหน้า (ก่อนที่ไฟล์นี้จะถูกเขียนทับด้วยรอบใหม่) เพื่อ
-    เทียบว่ามีหุ้นไหนเปลี่ยนเป็นสัญญาณเด่นตั้งแต่รอบที่แล้ว"""
-    if not os.path.exists(OUT_PATH):
-        return {}
-    try:
-        with open(OUT_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        rows = payload.get("data", [])
-        return {r.get("Ticker"): r.get("Signal") for r in rows if r.get("Ticker")}
-    except Exception as e:
-        print(f"อ่าน bundle รอบก่อนไม่ได้ (ข้ามไป ถือว่าไม่มีของเก่า): {e}")
-        return {}
+    """โหลด signal ของรอบก่อนหน้า เพื่อเทียบหาสัญญาณใหม่ (v3.5: เปลี่ยนจาก
+    อ่านไฟล์ local มาเป็นดึงจาก GitHub Release ก่อน เพราะไฟล์ local ไม่เหลือ
+    ข้าม run อีกแล้วตั้งแต่เลิก commit เข้า git — เหลือไว้อ่าน local file
+    เป็น fallback สำหรับตอนรันทดสอบในเครื่องเอง ไม่ผ่าน GitHub Action)"""
+    url = _release_asset_url("latest_scan.json")
+    if url:
+        try:
+            import requests
+            resp = requests.get(url, timeout=15)
+            if resp.ok:
+                rows = resp.json().get("data", [])
+                return {r.get("Ticker"): r.get("Signal") for r in rows if r.get("Ticker")}
+            print(f"ดึง release รอบก่อนไม่สำเร็จ (HTTP {resp.status_code}) — อาจเป็นรอบแรกสุดที่ยังไม่มี release")
+        except Exception as e:
+            print(f"ดึง release รอบก่อนไม่ได้ ({e}) — ลอง local file แทน")
+    if os.path.exists(OUT_PATH):
+        try:
+            with open(OUT_PATH, "r", encoding="utf-8") as f:
+                rows = json.load(f).get("data", [])
+            return {r.get("Ticker"): r.get("Signal") for r in rows if r.get("Ticker")}
+        except Exception as e:
+            print(f"อ่าน local file รอบก่อนไม่ได้: {e}")
+    return {}
 
 
 def main():
@@ -111,14 +135,31 @@ def main():
     total = len(all_tickers)
     for i in range(0, total, CHUNK_SIZE):
         chunk = all_tickers[i:i + CHUNK_SIZE]
-        chunk_df = app.batch_scan(tuple(chunk), "1y", "1d", bench_tuple, max_workers=4)
-        all_dfs.append(chunk_df)
-        done = min(i + CHUNK_SIZE, total)
-        print(f"  ...สแกนแล้ว {done}/{total} (chunk นี้ได้ {len(chunk_df)}/{len(chunk)} ตัว)")
+        try:
+            chunk_df = app.batch_scan(tuple(chunk), "1y", "1d", bench_tuple, max_workers=4)
+            all_dfs.append(chunk_df)
+            done = min(i + CHUNK_SIZE, total)
+            print(f"  ...สแกนแล้ว {done}/{total} (chunk นี้ได้ {len(chunk_df)}/{len(chunk)} ตัว)")
+        except Exception as e:
+            # v3.5: เดิมถ้า chunk ไหนพังกลางทาง (error ระดับ ThreadPoolExecutor
+            # เอง ไม่ใช่ error รายตัวหุ้นที่ analyze() ดักไว้แล้ว) สคริปต์ทั้งตัว
+            # จะพังทันที เสียผลของ chunk ก่อนหน้าที่ทำสำเร็จไปแล้วทั้งหมดไปด้วย
+            # ตอนนี้ดักไว้ ข้ามไป chunk ถัดไปแทน ไม่ให้ความพยายามที่ทำมาหายเปล่า
+            done = min(i + CHUNK_SIZE, total)
+            print(f"  ⚠️ chunk {i}-{done} พังกลางทาง ({type(e).__name__}: {e}) — ข้ามไป chunk ถัดไป")
         if done < total:
             time.sleep(PAUSE_BETWEEN_CHUNKS)
 
     df = pd.concat(all_dfs, ignore_index=True) if all_dfs else pd.DataFrame()
+
+    # v3.5: Data validation ชั้นที่ 2 — analyze() กรองราคา ≤0/NaN ออกไปแล้ว
+    # ชั้นหนึ่ง แต่เช็คซ้ำตรงนี้อีกรอบเผื่อมีช่องโหว่ทางอื่นหลุดเข้ามา (กันไว้)
+    if not df.empty and "Price" in df.columns:
+        before = len(df)
+        df = df[df["Price"].notna() & (df["Price"] > 0)]
+        if before != len(df):
+            print(f"  ตัดทิ้ง {before - len(df)} แถวที่ราคาผิดปกติ (≤0 หรือไม่มีค่า)")
+
     print(f"สแกนสำเร็จ {len(df)} / {len(all_tickers)} ตัว (ที่เหลือคือดึงไม่สำเร็จ/delisted/rate-limit ชั่วคราว — รอบหน้าจะลองใหม่)")
 
     if df.empty:
@@ -145,6 +186,16 @@ def main():
     with open(ALERTS_PATH, "w", encoding="utf-8") as f:
         json.dump({"generated_at": generated_at, "new_signals": new_hits}, f, ensure_ascii=False)
     print(f"บันทึก {ALERTS_PATH}")
+
+    # v3.5: เก็บ snapshot รายวันแยกไฟล์ (ลงวันที่ในชื่อไฟล์) ไว้ย้อนดูภายหลัง
+    # ว่าระบบแม่นแค่ไหนจริง — ไฟล์นี้จะถูก GitHub Action เอาไปสร้างเป็น release
+    # แยกต่างหาก (ดู prefetch.yml) แล้วลบ release ที่เก่ากว่า 90 วันออกอัตโนมัติ
+    # กันไม่ให้สะสมไม่จำกัด (ขัดกับเป้าหมายที่ลด storage bloat)
+    snapshot_path = os.path.join(BASE_DIR, "data", f"snapshot_{datetime.date.today().isoformat()}.json")
+    with open(snapshot_path, "w", encoding="utf-8") as f:
+        json.dump({"generated_at": generated_at, "data": df.to_dict(orient="records")},
+                   f, default=str, ensure_ascii=False)
+    print(f"บันทึก snapshot: {snapshot_path}")
 
     if new_hits and old_signals:
         # ส่ง Telegram เฉพาะตอนมีของรอบก่อนให้เทียบจริงๆ — รอบแรกสุด (ยังไม่มี
