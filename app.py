@@ -366,6 +366,10 @@ def fetch_nasdaq100():
 
 @st.cache_data(ttl=86400)
 def fetch_russell2000():
+    # ⚠️ v3.5: list นี้เป็นของแข็ง พิมพ์ไว้ตายตัว ไม่ได้ดึงสดจาก Russell index
+    # provider จริง (ไม่มี API ฟรีที่เชื่อถือได้สำหรับ index นี้) ตามเวลาที่ผ่านไป
+    # บริษัทเข้า-ออก index จริงจะไม่ตรงกับ list นี้อีกต่อไป ควรเข้ามาอัปเดตเอง
+    # เป็นระยะ (ดูรายชื่อล่าสุดได้จาก ETF อย่าง IWM ที่ track index นี้)
     return sorted(["ACVA","ALKT","ARCB","BJRI","CALX","CATO","CBRL","CLFD","COKE","CPSS",
         "CRAI","CRGY","CSWI","CVCO","DCOM","DFIN","DKNG","DNOW","DXPE","ECPG",
         "EFSC","EGHT","EPIX","ESCA","ETON","EVRI","EXPI","FBMS","FBNC","FCPT",
@@ -390,6 +394,8 @@ def fetch_russell2000():
 
 @st.cache_data(ttl=86400)
 def fetch_set():
+    # ⚠️ v3.5: list นี้เป็นของแข็งเหมือนกัน — หุ้นไทยเข้า-ออก SET/mai index
+    # จริงเปลี่ยนเป็นระยะ ควรเข้ามาเช็ค/อัปเดตเองทุก 6-12 เดือน
     base = ["ADVANC","AOT","AWC","BANPU","BBL","BDMS","BEM","BGRIM","BH","BJC",
             "BTS","CBG","CENTEL","CK","CPALL","CPF","CPN","CRC","DELTA","EA",
             "EGCO","GULF","HANA","HMPRO","INTUCH","IVL","JMT","KBANK","KCE",
@@ -403,6 +409,7 @@ def fetch_set():
 
 @st.cache_data(ttl=86400)
 def fetch_etfs():
+    # ⚠️ v3.5: list นี้เป็นของแข็ง — ETF ใหม่ๆที่ออกมาทีหลังจะไม่ถูกรวมอัตโนมัติ
     return sorted(["XLK","XLV","XLF","XLE","XLI","XLB","XLP","XLU","XLRE","XLC","XLY",
         "QQQ","QQQM","SOXX","SMH","HACK","IGV","WCLD","IWM","IWO","MDY","IJR",
         "EEM","EWJ","EWZ","FXI","VEA","VWO","INDA","TUR","EWY","EWT",
@@ -831,6 +838,13 @@ def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=N
         vl = df["Volume"]
         px = cl.iloc[-1]
 
+        # v3.5: Data validation — Yahoo บางครั้งส่งราคา 0/ติดลบ/NaN มา (ข้อมูล
+        # เสีย ไม่ใช่ราคาจริง) ตัดทิ้งตรงนี้เลยก่อนจะเอาไปคำนวณต่อ ป้องกัน
+        # ผลลัพธ์ผิดเพี้ยน (เช่น % เปลี่ยนแปลงเป็น inf) หลุดไปแสดงในตาราง
+        if pd.isna(px) or px <= 0:
+            log_err(f"analyze({ticker})", ValueError(f"ราคาผิดปกติจาก Yahoo: {px}"))
+            return None
+
         ep = {n: ema(cl, n).iloc[-1] for n in [5, 10, 20, 50, 100, 200]}
         ed = {n: round((px - v) / v * 100, 2) if v > 0 else np.nan for n, v in ep.items()}
 
@@ -1067,6 +1081,133 @@ def backtest(ticker: str, hold_days: int = 20) -> dict:
         return {"error": str(e)}
 
 
+# ────────────────────────────────────────────────────────────
+# SIGNAL ACCURACY BACKTEST (ใหม่ v3.5)
+# ตอบคำถาม "สัญญาณแม่นแค่ไหนจริงๆ" ด้วยหลักฐานจริง ไม่ใช่แค่เชื่อ label
+# วิธีทำ: ย้อนคำนวณว่าในแต่ละวันที่ผ่านมา หุ้นแต่ละตัว "เคยได้ signal อะไร"
+# (ใช้ข้อมูลถึงวันนั้นเท่านั้น ไม่มี lookahead) แล้ววัดผลตอบแทนจริงในอีก
+# 10/20 วันถัดไป สรุปเป็นค่าเฉลี่ย/win rate ต่อ signal ประเภทนั้นๆ
+# ────────────────────────────────────────────────────────────
+
+SIGNAL_BACKTEST_SAMPLE = (
+    # หุ้นใหญ่ (Large Cap) — เดิม
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA", "JPM", "BAC", "XOM",
+    "JNJ", "UNH", "HD", "WMT", "PG", "KO", "DIS", "NFLX", "ADBE", "CRM",
+    "CAT", "BA", "GE", "NEE", "LIN", "COST", "MCD", "NKE", "V", "MA",
+    "PTT.BK", "CPALL.BK", "AOT.BK", "KBANK.BK", "ADVANC.BK",
+    # v3.5: เพิ่มหุ้นเล็ก/กลาง (Small/Mid Cap) — เดิมมีแต่หุ้นใหญ่ ทั้งที่ของจริง
+    # ที่ระบบสแกนเจอบ่อยจาก Russell2000/Hidden Gem ส่วนใหญ่เป็นหุ้นเล็ก/กลาง
+    # พฤติกรรมราคาต่างจากหุ้นใหญ่มาก ผลทดสอบจากหุ้นใหญ่ล้วนๆอาจไม่สะท้อนของจริง
+    "DKNG", "SMCI", "UPST", "RIOT", "PODD", "LYFT", "SNOW", "TDOC",
+    "KTOS", "CALX", "LOCO", "FIZZ", "HALO", "RGEN", "SWAV",
+)
+
+
+def _wilder_rsi_series(prices: pd.Series, period: int = 14) -> pd.Series:
+    """RSI แบบคำนวณทุกวัน (rolling) ไม่ใช่แค่ค่าวันล่าสุดแบบ wilder_rsi() เดิม
+    — ใช้ EWM (alpha=1/period) ซึ่งให้ผลลัพธ์เท่ากับ Wilder smoothing แบบ
+    iterative หลังพ้นช่วง seed ต้นๆไปแล้ว (ใช้ backtest จากแท่งที่ 200 เป็นต้น
+    ไป จึงไม่กระทบความถูกต้อง)"""
+    d = prices.diff()
+    g = d.clip(lower=0)
+    l = (-d).clip(lower=0)
+    ag = g.ewm(alpha=1 / period, adjust=False).mean()
+    al = l.ewm(alpha=1 / period, adjust=False).mean()
+    rs = ag / al.replace(0, np.nan)
+    return (100 - 100 / (1 + rs)).fillna(100)
+
+
+def _signal_history_for_ticker(ticker: str) -> pd.DataFrame:
+    """คำนวณ signal ของทุกวันในอดีต (2 ปี) ของหุ้นตัวเดียว + ผลตอบแทนจริงใน
+    อีก 10/20 วันถัดไปจากจุดนั้น นับเฉพาะ "จุดที่เพิ่งเปลี่ยนเป็น signal นี้"
+    (ไม่นับวันต่อเนื่องที่ signal เดิมค้างอยู่) กันไม่ให้ sample ดูมากเกินจริง
+    จากการนับวันซ้ำๆของสัญญาณเดียวกัน"""
+    try:
+        df = _download_2y(ticker)
+        if df is None or len(df) < 230:
+            return pd.DataFrame()
+        cl, vl = df["Close"], df["Volume"]
+        e50, e200 = ema(cl, 50), ema(cl, 200)
+        rsi_s = _wilder_rsi_series(cl)
+        ml_s = ema(cl, 12) - ema(cl, 26)
+        mh_s = ml_s - ema(ml_s, 9)
+        vm20_s = vl / vl.rolling(20).mean()
+        hi52_s = cl.rolling(252, min_periods=50).max()
+        draw_s = (cl - hi52_s) / hi52_s * 100
+
+        rows, prev_sig, n = [], None, len(df)
+        for i in range(200, n - 20):
+            px = cl.iloc[i]
+            stars = conservative_stars(px, e200.iloc[i], rsi_s.iloc[i], vm20_s.iloc[i] or 0, draw_s.iloc[i] or 0)
+            sig, _ = strategy_signal(px, e200.iloc[i], e50.iloc[i], rsi_s.iloc[i], vm20_s.iloc[i] or 0, mh_s.iloc[i], stars)
+            if sig != prev_sig:
+                rows.append({
+                    "ticker": ticker, "signal": sig,
+                    "fwd10": round((cl.iloc[i + 10] - px) / px * 100, 2),
+                    "fwd20": round((cl.iloc[i + 20] - px) / px * 100, 2),
+                })
+            prev_sig = sig
+        return pd.DataFrame(rows)
+    except Exception as e:
+        log_err(f"signal_history({ticker})", e)
+        return pd.DataFrame()
+
+
+def _confidence_flag(n: int) -> str:
+    """v3.5: เตือนตรงๆว่าจำนวนครั้งน้อยเกินจะเชื่อทางสถิติได้ — เคยพบจริงตอน
+    ทดสอบว่า signal บางแบบมีแค่ 1-2 ครั้งทั้ง sample แล้วโชว์ Win Rate 100%
+    ซึ่งไม่มีความหมายทางสถิติเลย แต่หน้าตาตารางดูน่าเชื่อเท่าแถวที่มีร้อยครั้ง"""
+    if n >= 20:
+        return "✅ พอเชื่อได้"
+    if n >= 10:
+        return "🔸 น้อย ระวัง"
+    return "⚠️ น้อยมาก ไม่ควรเชื่อ"
+
+
+SIGNAL_BACKTEST_NOTES = (
+    "ทดสอบจากหุ้นตัวอย่าง 50 ตัว ผสมหุ้นใหญ่+เล็ก/กลาง (ไม่ใช่ทุกหุ้นใน universe) "
+    "ย้อนหลัง 2 ปี · นับเฉพาะจุดที่ signal เพิ่งเปลี่ยน ไม่นับวันต่อเนื่องซ้ำ แต่ "
+    "signal จากหุ้นคนละตัวในช่วงเวลาเดียวกันอาจมีความเชื่อมโยงกัน (เช่น ตลาดรวมขึ้น) "
+    "ทำให้ไม่ใช่ independent sample เต็มรูปแบบ · แถวที่ 'จำนวนครั้ง' น้อย "
+    "(ดูคอลัมน์ความเชื่อมั่น) ตัวเลขยังไม่น่าเชื่อถือพอทางสถิติ · ไม่หักค่าคอมมิชชั่น/"
+    "สเปรด · ผลย้อนหลังไม่ใช่การันตีอนาคต ไม่ใช่คำแนะนำการลงทุน"
+)
+
+
+@st.cache_data(ttl=86400)
+def backtest_signal_accuracy(sample: tuple = SIGNAL_BACKTEST_SAMPLE) -> dict:
+    """รวมผล signal history ของหุ้นตัวอย่างทั้งหมด สรุปเป็นตารางต่อ signal
+    ประเภท (จำนวนครั้ง, ผลตอบแทนเฉลี่ย, win rate ที่ 10 และ 20 วัน)"""
+    all_dfs = [d for tk in sample if not (d := _signal_history_for_ticker(tk)).empty]
+    if not all_dfs:
+        return {"error": "ดึงข้อมูลไม่สำเร็จเลยสักตัว ลองใหม่อีกครั้ง"}
+    full = pd.concat(all_dfs, ignore_index=True)
+
+    agg = full.groupby("signal").agg(
+        จำนวนครั้ง=("signal", "count"),
+        **{"ผลตอบแทนเฉลี่ย 10วัน%": ("fwd10", "mean")},
+        **{"Win Rate 10วัน%": ("fwd10", lambda x: round((x > 0).mean() * 100, 1))},
+        **{"ผลตอบแทนเฉลี่ย 20วัน%": ("fwd20", "mean")},
+        **{"Win Rate 20วัน%": ("fwd20", lambda x: round((x > 0).mean() * 100, 1))},
+    ).round(2).reset_index().rename(columns={"signal": "Signal"})
+    agg["ความเชื่อมั่น"] = agg["จำนวนครั้ง"].apply(_confidence_flag)
+    agg = agg.sort_values("ผลตอบแทนเฉลี่ย 20วัน%", ascending=False)
+
+    # Buy & Hold เฉลี่ยของหุ้นตัวอย่างทั้งหมดในช่วงเดียวกัน เอาไว้เทียบบรรทัดฐาน
+    bh_rets = []
+    for tk in sample:
+        try:
+            d = _download_2y(tk)
+            if d is not None and len(d) > 220:
+                bh_rets.append((d["Close"].iloc[-1] - d["Close"].iloc[200]) / d["Close"].iloc[200] * 100)
+        except Exception:
+            pass
+    bh_avg = round(float(np.mean(bh_rets)), 2) if bh_rets else None
+
+    return {"table": agg, "n_tickers": len(all_dfs), "n_events": len(full),
+            "buy_hold_avg": bh_avg, "notes": SIGNAL_BACKTEST_NOTES}
+
+
 # ════════════════════════════════════════════════════════
 # [merged from lib/styles.py]
 # ════════════════════════════════════════════════════════
@@ -1288,6 +1429,14 @@ def _sty_wr(v):
         return ""
 
 
+def _sty_confidence(v):
+    v = str(v)
+    if "พอเชื่อได้" in v: return "color:#3fb950;font-weight:600;"
+    if "น้อย ระวัง" in v: return "color:#d29922;font-weight:600;"
+    if "น้อยมาก" in v: return "color:#f85149;font-weight:700;"
+    return "color:#8b949e;"
+
+
 BASE_TBL = {
     "background-color": "#161b22",
     "color": "#e6edf3",
@@ -1474,6 +1623,20 @@ def maybe_notify_telegram(message: str) -> bool:
         return False
 
 
+# v3.5: เปลี่ยนจาก git commit ทุกวัน → เก็บไฟล์ที่ GitHub Release แทน
+# (เดิม commit ไฟล์ ~800KB เข้า repo ทุกวัน จะกลายเป็น ~300MB/ปี ในระยะยาว
+# repo จะบวมขึ้นเรื่อยๆ ไม่มีที่สิ้นสุด) แอปนี้อ่านจาก Release URL ตรงๆ
+# (public URL ไม่ต้องมี API key) ไม่ต้องพึ่งไฟล์ใน git เลย
+#
+# ⚠️ เปลี่ยนค่านี้ถ้า fork/เปลี่ยนชื่อ repo:
+GITHUB_REPO = "bigpk2002/BANNVICH01"
+RELEASE_TAG = "latest-data"
+PREFETCH_URL = f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/latest_scan.json"
+ALERTS_URL = f"https://github.com/{GITHUB_REPO}/releases/download/{RELEASE_TAG}/alerts.json"
+
+# ไฟล์ local ใช้เป็น fallback เฉพาะตอนรันทดสอบในเครื่องเอง (python fetch_data.py
+# ตรงๆ โดยไม่ผ่าน GitHub Action) — ตอน deploy จริงบน Streamlit Cloud จะไม่มี
+# ไฟล์นี้อยู่ในเครื่อง (เพราะไม่ได้ commit เข้า git แล้ว) จะใช้ทาง Release เสมอ
 PREFETCH_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "latest_scan.json")
 ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "alerts.json")
 
@@ -1481,39 +1644,53 @@ ALERTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "
 @st.cache_data(ttl=300)
 def load_prefetched_bundle():
     """
-    อ่านไฟล์ data/latest_scan.json ที่ GitHub Actions ดึงไว้ล่วงหน้าทุกวันหลังตลาดปิด
-    (ใหม่ v3.2) — เปลี่ยนจาก v3.0/3.1 ที่ต้องรอให้มีคนกด Run Screener ก่อน
-    ถึงจะมีข้อมูล ตอนนี้ "การดึงข้อมูล" กับ "การดู" แยกกันคนละจุดสมบูรณ์ ไฟล์นี้
-    ถูกเขียนโดย fetch_data.py (รันจาก GitHub Action) ไม่ใช่จากแอปตัวนี้เอง
+    ดึงข้อมูลที่ GitHub Actions เตรียมไว้ล่วงหน้าทุกวันหลังตลาดปิด
 
-    คืนค่า (generated_at: str|None, df: pd.DataFrame) — ถ้ายังไม่มีไฟล์
-    (เช่น ก่อน Action รันรอบแรก) จะคืน (None, DataFrame ว่าง)
+    v3.5: เปลี่ยนจากอ่านไฟล์ local (data/latest_scan.json) เป็นดึงจาก
+    GitHub Release URL ตรงๆ — เพราะไม่ commit ไฟล์เข้า git แล้ว (กัน repo
+    บวม) ลองไฟล์ local ก่อนเผื่อรันทดสอบในเครื่องเอง ถ้าไม่มีค่อย fallback
+    ไปดึงจาก Release
+
+    คืนค่า (generated_at: str|None, df: pd.DataFrame) — ถ้ายังไม่มีข้อมูล
+    เลย (เช่น ก่อน Action รันรอบแรก) จะคืน (None, DataFrame ว่าง)
     """
-    if not os.path.exists(PREFETCH_PATH):
-        return None, pd.DataFrame()
+    if os.path.exists(PREFETCH_PATH):
+        try:
+            with open(PREFETCH_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            return payload.get("generated_at"), pd.DataFrame(payload.get("data", []))
+        except Exception as e:
+            log_err("load_prefetched_bundle(local)", e)
     try:
-        with open(PREFETCH_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload.get("generated_at"), pd.DataFrame(payload.get("data", []))
+        import requests
+        resp = requests.get(PREFETCH_URL, timeout=15)
+        if resp.ok:
+            payload = resp.json()
+            return payload.get("generated_at"), pd.DataFrame(payload.get("data", []))
     except Exception as e:
-        log_err("load_prefetched_bundle", e)
-        return None, pd.DataFrame()
+        log_err("load_prefetched_bundle(release)", e)
+    return None, pd.DataFrame()
 
 
 @st.cache_data(ttl=300)
 def load_prefetch_alerts():
-    """อ่าน data/alerts.json (สัญญาณใหม่ระหว่างรอบล่าสุดกับรอบก่อนหน้า) ที่
-    fetch_data.py คำนวณไว้แล้วครั้งเดียวตอนดึงข้อมูล (ใหม่ v3.2) — ไม่คำนวณซ้ำ
-    ทุกครั้งที่มีคนเข้าเว็บ เพื่อไม่ให้ผลลัพธ์ขึ้นกับว่าใครเข้ามาดูก่อน-หลัง"""
-    if not os.path.exists(ALERTS_PATH):
-        return []
+    """อ่านสัญญาณใหม่ระหว่างรอบล่าสุดกับรอบก่อนหน้า ที่ fetch_data.py คำนวณ
+    ไว้แล้วครั้งเดียวตอนดึงข้อมูล (v3.5: ดึงจาก Release แทนไฟล์ local เหมือน
+    load_prefetched_bundle ด้านบน ด้วยเหตุผลเดียวกัน)"""
+    if os.path.exists(ALERTS_PATH):
+        try:
+            with open(ALERTS_PATH, "r", encoding="utf-8") as f:
+                return json.load(f).get("new_signals", [])
+        except Exception as e:
+            log_err("load_prefetch_alerts(local)", e)
     try:
-        with open(ALERTS_PATH, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-        return payload.get("new_signals", [])
+        import requests
+        resp = requests.get(ALERTS_URL, timeout=15)
+        if resp.ok:
+            return resp.json().get("new_signals", [])
     except Exception as e:
-        log_err("load_prefetch_alerts", e)
-        return []
+        log_err("load_prefetch_alerts(release)", e)
+    return []
 
 
 def get_with_bundle_fallback(tickers: list, bundle_df: pd.DataFrame, max_live_fallback: int = 15) -> pd.DataFrame:
@@ -1594,14 +1771,6 @@ def main():
         max_tk = st.slider("Max Tickers | จำนวนหุ้นสูงสุด", 10, 300, 50, step=10)
 
         st.markdown("---")
-        notify_tg = st.checkbox("📲 แจ้งเตือนผ่าน Telegram ถ้าตั้งค่าไว้", value=True,
-                                help="เฉพาะตอนกด Run สแกนสดด้วยตัวเอง — ต้องตั้ง "
-                                     "TELEGRAM_BOT_TOKEN และ TELEGRAM_CHAT_ID ใน "
-                                     ".streamlit/secrets.toml ก่อน ถ้าไม่ตั้งจะไม่มีผลอะไร "
-                                     "(ส่วนการแจ้งเตือนของรอบ prefetch อัตโนมัติทุกวันหลังตลาดปิด "
-                                     "ตั้งค่าแยกที่ GitHub Action ไม่เกี่ยวกับติ๊กนี้)")
-
-        st.markdown("---")
         run_btn = st.button("🚀 Run Screener | สแกนสดเดี๋ยวนี้", use_container_width=True,
                             help="ปกติไม่ต้องกดเลย — ข้อมูลมาจากรอบดึงอัตโนมัติทุกวันหลังตลาดปิด อยู่แล้ว "
                                  "กดปุ่มนี้เฉพาะตอนอยากได้ข้อมูลสดเดี๋ยวนี้ ไม่รอรอบถัดไป")
@@ -1666,7 +1835,7 @@ def main():
         last_sig = load_last_signals(universe)
         new_signal_hits = detect_new_signals(df, last_sig)
         save_last_signals(universe, signals_snapshot(df))
-        if new_signal_hits and notify_tg:
+        if new_signal_hits:
             msg = "🔔 สัญญาณใหม่ (" + universe + "): " + ", ".join(
                 f"{h['ticker']} {h['signal']}" for h in new_signal_hits[:20])
             maybe_notify_telegram(msg)
@@ -2167,6 +2336,33 @@ def main():
                         tdf = pd.DataFrame({"Trade #": range(1, len(trades) + 1), "Return %": trades})
                         tdf["Result"] = tdf["Return %"].apply(lambda x: "✅ Win" if x > 0 else "❌ Loss")
                         st.dataframe(make_table(tdf), use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("### 📊 Signal Accuracy — สัญญาณแต่ละแบบแม่นแค่ไหนจริงๆ")
+        st.caption("ย้อนดูประวัติหุ้นตัวอย่าง 50 ตัว (ผสมหุ้นใหญ่+เล็ก/กลาง) 2 ปี หาทุกจุดที่เคยได้ "
+                  "signal แต่ละแบบ แล้ววัดผลตอบแทนจริงใน 10/20 วันถัดไป — ใช้แทนการเชื่อ label เฉยๆ")
+
+        run_sig_bt = st.button("🔬 วิเคราะห์ Signal Accuracy", key="sig_bt_run")
+        if run_sig_bt:
+            with st.spinner("กำลังย้อนวิเคราะห์ signal ของหุ้นตัวอย่าง 50 ตัว (อาจใช้เวลา 1-2 นาที)…"):
+                sig_res = backtest_signal_accuracy()
+            st.session_state["sig_bt_res"] = sig_res
+
+        if "sig_bt_res" in st.session_state:
+            sig_res = st.session_state["sig_bt_res"]
+            if "error" in sig_res:
+                st.error(f"❌ {sig_res['error']}")
+            else:
+                st.caption(f"วิเคราะห์จากหุ้น {sig_res['n_tickers']} ตัว · พบจุดเปลี่ยน signal "
+                          f"{sig_res['n_events']} ครั้งทั้งหมด · Buy & Hold เฉลี่ยของกลุ่มตัวอย่างช่วงเดียวกัน: "
+                          f"{sig_res['buy_hold_avg']:+.1f}%" if sig_res.get("buy_hold_avg") is not None else "")
+                sig_table = sig_res["table"]
+                sig_smap = {"Signal": _sty_signal, "ผลตอบแทนเฉลี่ย 10วัน%": _sty_rs,
+                           "ผลตอบแทนเฉลี่ย 20วัน%": _sty_rs, "Win Rate 10วัน%": _sty_wr,
+                           "Win Rate 20วัน%": _sty_wr, "ความเชื่อมั่น": _sty_confidence}
+                st.dataframe(make_table(sig_table, sig_smap), use_container_width=True)
+                with st.expander("⚠️ ข้อจำกัดของผลทดสอบนี้ (อ่านก่อนเชื่อตัวเลข)"):
+                    st.caption(sig_res["notes"])
 
     # ════════════════════════════════════════════════════════
     # TAB 5: SECTOR MAP
