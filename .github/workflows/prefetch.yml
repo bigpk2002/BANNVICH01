@@ -16,6 +16,11 @@ jobs:
   fetch:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # v3.5: ต้องมีสิทธิ์ write เพื่อสร้าง/แก้ไข Release ได้ (ปกติจะมีอยู่แล้วถ้า
+    # Settings > Actions > General ตั้ง "Read and write permissions" ไว้ แต่
+    # ระบุตรงนี้ชัดๆอีกชั้นเพื่อความชัวร์)
+    permissions:
+      contents: write
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -34,10 +39,48 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python fetch_data.py
 
-      - name: Commit และ push ข้อมูลใหม่
+      # v3.5: เปลี่ยนจาก "git commit เข้า repo ทุกวัน" (ทำให้ repo บวมขึ้น
+      # เรื่อยๆไม่มีที่สิ้นสุด ~ปีละ 300MB+) มาเป็น "อัปโหลดเป็น Release asset"
+      # แทน — repo สะอาด ไม่มี commit ใหม่เพิ่มขึ้นเลย แอปอ่านจาก Release URL
+      # ตรงๆ (public URL ไม่ต้องมี API key ฝั่งอ่าน)
+      - name: อัปโหลดข้อมูลล่าสุดไปที่ GitHub Release (แทนการ commit เข้า git)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/latest_scan.json data/alerts.json
-          git diff --quiet --cached || git commit -m "Auto-update prefetched stock data [skip ci]"
-          git push
+          if ! gh release view latest-data >/dev/null 2>&1; then
+            gh release create latest-data \
+              --title "ข้อมูลล่าสุด (อัปเดตอัตโนมัติ)" \
+              --notes "ไม่ใช่ release โค้ดจริง ใช้เก็บไฟล์ข้อมูลที่ดึงอัตโนมัติทุกวันเท่านั้น"
+          fi
+          gh release upload latest-data data/latest_scan.json data/alerts.json --clobber
+
+      # v3.5: เก็บ snapshot รายวันไว้เป็น release แยกต่างหาก (ลงวันที่ใน tag)
+      # เพื่อย้อนดูในอนาคตได้ว่าระบบแม่นแค่ไหนจริง — เก็บไว้ 90 วันแล้วลบทิ้ง
+      - name: สร้าง Historical Snapshot ของวันนี้
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TODAY=$(date -u +%F)
+          TAG="snapshot-$TODAY"
+          SNAPSHOT_FILE=$(ls data/snapshot_*.json 2>/dev/null | head -n 1)
+          if [ -n "$SNAPSHOT_FILE" ]; then
+            gh release create "$TAG" "$SNAPSHOT_FILE" \
+              --title "Snapshot $TODAY" \
+              --notes "ข้อมูล ณ วันที่ $TODAY (auto-prune หลัง 90 วัน)" \
+              || gh release upload "$TAG" "$SNAPSHOT_FILE" --clobber
+          else
+            echo "ไม่พบไฟล์ snapshot ของวันนี้ — ข้ามขั้นนี้"
+          fi
+
+      - name: ลบ Snapshot ที่เก่ากว่า 90 วัน
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CUTOFF=$(date -u -d "90 days ago" +%F)
+          gh release list --limit 300 --json tagName -q '.[].tagName' | grep '^snapshot-' | while read -r tag; do
+            tag_date="${tag#snapshot-}"
+            if [[ "$tag_date" < "$CUTOFF" ]]; then
+              echo "ลบ release เก่า: $tag (เก่ากว่า $CUTOFF)"
+              gh release delete "$tag" --yes --cleanup-tag || true
+            fi
+          done
