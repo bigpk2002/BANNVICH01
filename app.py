@@ -610,6 +610,72 @@ def signal_age(closes: pd.Series) -> int:
     return -1
 
 
+def find_support_levels(df: pd.DataFrame, lookback: int = 120, swing_window: int = 5) -> list:
+    """
+    หาแนวรับจาก swing low ในอดีต (จุดต่ำสุดที่ราคาเคยเด้งกลับขึ้นมา) — เป็น
+    วิธีคลาสสิกที่นักเทคนิคัลใช้หาแนวรับ ต่างจาก EMA ตรงที่อิงจาก "ราคาที่
+    ตลาดเคยปกป้องจริง" ไม่ใช่ค่าเฉลี่ยทางคณิตศาสตร์
+
+    วิธีหา swing low: แท่งที่ Low ต่ำกว่าทุกแท่งในช่วง ±swing_window วัน
+    (ทั้งซ้ายและขวา) ถือเป็นจุดที่ตลาดเคย "ปฏิเสธ" ไม่ให้ราคาลงต่อ
+
+    คืนค่า list ของราคาแนวรับ เรียงจากมากไปน้อย (ใกล้ราคาปัจจุบันสุดอยู่บน)
+    """
+    if df is None or len(df) < swing_window * 2 + 10:
+        return []
+    recent = df.iloc[-lookback:] if len(df) > lookback else df
+    lows = recent["Low"].values
+    n = len(lows)
+    swings = []
+    for i in range(swing_window, n - swing_window):
+        window = lows[i - swing_window:i + swing_window + 1]
+        if lows[i] == window.min():
+            swings.append(round(float(lows[i]), 2))
+    # รวม swing low ที่ใกล้กันมาก (ภายใน 1%) เป็นระดับเดียวกัน กันแนวรับซ้ำซ้อน
+    swings = sorted(set(swings), reverse=True)
+    merged = []
+    for lvl in swings:
+        if not merged or abs(lvl - merged[-1]) / merged[-1] > 0.01:
+            merged.append(lvl)
+    return merged
+
+
+def support_status(price: float, df: pd.DataFrame, e50: float, e200: float) -> tuple:
+    """
+    สรุปสถานะแนวรับของหุ้นตัวนี้ ณ ราคาปัจจุบัน — รวมทั้ง swing-low support
+    และ EMA50/EMA200 (เส้นที่ราคามักเด้งกลับเมื่อแตะ ถือเป็นแนวรับเชิงพลวัตได้)
+    เลือกแนวรับที่ "ใกล้ราคาปัจจุบันที่สุดจากด้านล่าง" มาเทียบ เพราะเป็นจุดที่
+    มีนัยสำคัญที่สุดสำหรับการตัดสินใจตอนนี้
+
+    คืนค่า (status, support_price, distance_pct):
+      status: "🟢 อยู่ที่แนวรับ" / "🟡 ใกล้แนวรับ" / "—"
+      distance_pct: ระยะห่างจากแนวรับเป็น % (ราคาปัจจุบันสูงกว่าแนวรับเท่าไหร่)
+    """
+    candidates = []
+    for lvl in find_support_levels(df):
+        if lvl <= price:
+            candidates.append(("Swing Low", lvl))
+    if e50 > 0 and e50 <= price:
+        candidates.append(("EMA50", e50))
+    if e200 > 0 and e200 <= price:
+        candidates.append(("EMA200", e200))
+
+    if not candidates:
+        return "—", np.nan, np.nan
+
+    # เลือกแนวรับที่อยู่ใกล้ราคาปัจจุบันที่สุด (สูงสุดในบรรดาที่ต่ำกว่าราคา)
+    src, lvl = max(candidates, key=lambda x: x[1])
+    dist_pct = round((price - lvl) / lvl * 100, 2)
+
+    if dist_pct <= 1.5:
+        status = "🟢 อยู่ที่แนวรับ"
+    elif dist_pct <= 4.0:
+        status = "🟡 ใกล้แนวรับ"
+    else:
+        status = "—"
+    return status, round(lvl, 2), dist_pct
+
+
 def quiet_accumulation(volumes: pd.Series, closes: pd.Series, rsi: float, n: int = 10) -> tuple:
     if len(volumes) < n or len(closes) < n:
         return 0, "—"
@@ -875,6 +941,7 @@ def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=N
         acc_sc, acc_lb = quiet_accumulation(vl, cl, rsi_val)
         sq_lbl, bw_now, bw_delta = squeeze_direction(cl)
         age = signal_age(cl)
+        sup_status, sup_level, sup_dist = support_status(px, df, ep[50], ep[200])
 
         rs20 = rs50 = np.nan
         if bench_tuple:
@@ -900,6 +967,7 @@ def analyze(ticker: str, period: str = "1y", interval: str = "1d", bench_tuple=N
             "Candle": patt, "EMA Pattern": ep_lbl, "Pat Score": ep_sc,
             "Accum": acc_lb, "Accum Score": acc_sc, "Gem Score": gs, "💎 Gem": gl,
             "Squeeze": sq_lbl, "BW%": bw_now, "BW Δ5d": bw_delta, "Signal Age": age,
+            "Support": sup_status, "Support Level": sup_level, "Support Dist%": sup_dist,
             "RS 20D": rs20, "RS 50D": rs50,
             "P/E": fnd["pe"], "P/BV": fnd["pb"], "Div%": fnd["div"], "MktCap$B": fnd["mktcap_b"],
         }
@@ -1439,6 +1507,13 @@ def _sty_squeeze(v):
     if "Tightening" in v: return "color:#5ee6ff;font-weight:700;"
     if "Just Broke" in v: return "color:#34f5a4;font-weight:700;"
     if "Expanding" in v:  return "color:#ffd76a;font-weight:600;"
+    return "color:#5b7299;"
+
+
+def _sty_support(v):
+    v = str(v)
+    if "อยู่ที่แนวรับ" in v: return "color:#34f5a4;font-weight:800;"
+    if "ใกล้แนวรับ" in v:   return "color:#ffc857;font-weight:700;"
     return "color:#5b7299;"
 
 
@@ -2012,9 +2087,16 @@ def main():
 | 🔄 Neutral | ไม่เข้าเงื่อนไขข้อใดชัดเจน |
 
 ทุก signal คำนวณจาก threshold ที่ตั้งตามหลักการวิเคราะห์เทคนิคัลทั่วไป **ไม่ได้ backtest แยกทีละแบบ** ว่าให้ผลตอบแทนจริงดีกว่าสุ่มหรือไม่ (มีแค่กลยุทธ์ EMA Squeeze ใน tab Backtester ที่ทดสอบแล้วจริง)
+
+---
+**🟢 Support (แนวรับ)** หาจาก 2 แหล่งแล้วเลือกอันที่ใกล้ราคาปัจจุบันที่สุด:
+- **Swing Low** — จุดต่ำสุดในอดีต (120 วันล่าสุด) ที่ราคาเคยเด้งกลับขึ้นมาแล้วจริง
+- **EMA50 / EMA200** — เส้นค่าเฉลี่ยที่ราคามักเด้งกลับเมื่อแตะ
+
+แบ่งสถานะตามระยะห่างจากแนวรับ: **🟢 อยู่ที่แนวรับ** (ห่าง ≤1.5%) / **🟡 ใกล้แนวรับ** (ห่าง 1.5-4%) / ไม่แสดงถ้าไกลกว่านั้น — ⚠️ แนวรับในอดีตไม่ได้การันตีว่าจะหยุดราคาได้อีกในอนาคต ถ้าหลุดแนวรับลงไปมักลงต่อแรง ควรมีจุดตัดขาดทุนเสมอ
                 """)
 
-            fc1, fc2, fc3 = st.columns(3)
+            fc1, fc2, fc3, fc4 = st.columns(4)
             with fc1:
                 sig_filter = st.multiselect("Signal | สัญญาณ", df["Signal"].unique().tolist() if "Signal" in df else [],
                                             default=[], key="d_sig", placeholder="ทั้งหมด")
@@ -2024,14 +2106,22 @@ def main():
             with fc3:
                 sq_filter = st.multiselect("Squeeze | การหดตัว", df["Squeeze"].unique().tolist() if "Squeeze" in df else [],
                                            default=[], key="d_sq", placeholder="ทั้งหมด")
+            with fc4:
+                sup_filter = st.multiselect("Support | แนวรับ",
+                                            ["🟢 อยู่ที่แนวรับ", "🟡 ใกล้แนวรับ"],
+                                            default=[], key="d_sup", placeholder="ทั้งหมด")
 
             show_cols = [c for c in ["Ticker", "Price", "ราคาปิด", "Trend", "RSI", "EMA Pattern",
-                                     "Squeeze", "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal",
+                                     "Squeeze", "Support", "Support Level", "Support Dist%",
+                                     "Signal Age", "💎 Gem", "Accum", "RS 20D", "Signal",
                                      "Signal Reason", "Stars"]
                          if c in df.columns]
             dfv = df[show_cols].copy()
             if "Signal Reason" in dfv.columns:
                 dfv = dfv.rename(columns={"Signal Reason": "เหตุผล"})
+            if "Support Dist%" in dfv.columns:
+                dfv["Support Dist%"] = dfv["Support Dist%"].apply(
+                    lambda x: f"+{x:.1f}%" if pd.notna(x) else "—")
 
             if "Signal Age" in dfv.columns:
                 dfv["Signal Age"] = dfv["Signal Age"].apply(
@@ -2041,6 +2131,7 @@ def main():
             if sig_filter: mask &= df["Signal"].isin(sig_filter)
             if trend_filter: mask &= df["Trend"].apply(lambda x: any(t in str(x) for t in trend_filter))
             if sq_filter: mask &= df["Squeeze"].isin(sq_filter)
+            if sup_filter and "Support" in df.columns: mask &= df["Support"].isin(sup_filter)
             if min_gem > 0 and "Gem Score" in df.columns: mask &= df["Gem Score"] >= min_gem
             if min_accum > 0 and "Accum Score" in df.columns: mask &= df["Accum Score"] >= min_accum
             if pat_filter and "EMA Pattern" in df.columns:
@@ -2054,8 +2145,8 @@ def main():
                 dfv = dfv.sort_values("_p").drop(columns=["_p"])
 
             smap = {"Signal": _sty_signal, "💎 Gem": _sty_gem, "RSI": _sty_rsi,
-                    "Squeeze": _sty_squeeze, "RS 20D": _sty_rs, "Accum": _sty_signal,
-                    "EMA Pattern": _sty_signal}
+                    "Squeeze": _sty_squeeze, "Support": _sty_support, "RS 20D": _sty_rs,
+                    "Accum": _sty_signal, "EMA Pattern": _sty_signal}
             st.markdown(f"**{len(dfv)} หุ้นที่ตรงเงื่อนไข**")
             st.dataframe(make_table(dfv, smap), use_container_width=True, height=520)
 
@@ -2196,6 +2287,19 @@ def main():
                 sig_now = row.get("Signal", "—")
                 sig_reason_now = row.get("Signal Reason", "")
                 rs20_now = row.get("RS 20D", np.nan)
+                sup_now = row.get("Support", "—")
+                sup_level_now = row.get("Support Level", np.nan)
+                sup_dist_now = row.get("Support Dist%", np.nan)
+
+                sup_badge = ""
+                if sup_now != "—" and pd.notna(sup_level_now):
+                    sup_col = "#34f5a4" if "อยู่ที่แนวรับ" in str(sup_now) else "#ffc857"
+                    sup_badge = (
+                        f'<span style="background:rgba(52,245,164,0.08);border:1px solid {sup_col};'
+                        f'border-radius:6px;padding:4px 12px;font-size:0.85rem;font-weight:700;'
+                        f'color:{sup_col};">'
+                        f'{sup_now} ${sup_level_now:,.2f} ({sup_dist_now:+.1f}%)</span>'
+                    )
 
                 st.markdown(
                     f'<div style="display:flex;align-items:center;gap:16px;'
@@ -2216,6 +2320,7 @@ def main():
                     f'<span style="background:#16213a;border:1px solid #22344f;'
                     f'border-radius:6px;padding:4px 12px;font-size:0.85rem;font-weight:700;">'
                     f'{sig_now}</span>'
+                    f'{sup_badge}'
                     f'</div>', unsafe_allow_html=True)
                 if sig_reason_now:
                     st.caption(f"เหตุผล: {sig_reason_now}")
